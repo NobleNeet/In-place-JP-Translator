@@ -125,7 +125,7 @@
 
   function handleMessage(request) {
     if (!request || !request.type) return Promise.resolve({ error: 'unknown message type' });
-    if (request.type === MSG_TRANSLATE) {
+    if (request.type === MSG_TRANSLATE_PAGE) {
       var root = request.root;
       return translatePage(root);
     }
