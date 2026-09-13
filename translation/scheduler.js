@@ -1,43 +1,40 @@
 // translation/scheduler.js
-// Bounded concurrency limiter (semaphore).
-// Guarantees the number of in-flight requests never exceeds `concurrency`.
+// Classic-script module. Exports: ns.Semaphore
+// Concurrency limiter. Runs a queue of async tasks; keeps in-flight count
+// <= max. Used by background to bound API fan-out and by the page queue later.
+(function () {
+  var ns = globalThis.__PLAMO__;
 
-export class Semaphore {
-  constructor(concurrency = 2) {
-    this.concurrency = Math.max(1, concurrency | 0);
-    this.active = 0;
-    this.waiters = [];
-  }
+  function Semaphore(max) {
+    if (!Number.isFinite(max) || max < 1) throw new Error('Semaphore: max must be >= 1');
+    var maxSlots = max;
+    var active = 0;
+    var queue = [];
 
-  update(concurrency) {
-    this.concurrency = Math.max(1, concurrency | 0);
-    this._pump();
-  }
-
-  acquire() {
-    if (this.active < this.concurrency) {
-      this.active += 1;
-      return Promise.resolve();
+    function pump() {
+      while (active < maxSlots && queue.length) {
+        var next = queue.shift();
+        active++;
+        next.fn().then(next.ok, next.err).finally(function () {
+          active--;
+          pump();
+        });
+      }
     }
-    return new Promise((resolve) => {
-      this.waiters.push(resolve);
-    });
-  }
 
-  release() {
-    this.active = Math.max(0, this.active - 1);
-    this._pump();
-  }
-
-  get pending() {
-    return this.waiters.length;
-  }
-
-  _pump() {
-    while (this.active < this.concurrency && this.waiters.length > 0) {
-      this.active += 1;
-      const resolve = this.waiters.shift();
-      resolve();
+    function run(fn) {
+      return new Promise(function (resolve, reject) {
+        queue.push({ fn: fn, ok: resolve, err: reject });
+        pump();
+      });
     }
+
+    return {
+      run: run,
+      getActive: function () { return active; },
+      getPending: function () { return queue.length; }
+    };
   }
-}
+
+  ns.Semaphore = Semaphore;
+})();

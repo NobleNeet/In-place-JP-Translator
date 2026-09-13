@@ -1,32 +1,35 @@
 // content/renderer.js
-// Applies a translation to a segment's DOM node and preserves the original.
-//
-// The original English text is preserved via data-* attributes so a future
-// UI can toggle between: translation only / original only / both.
+// Classic-script module. Exports: ns.renderer
+// Applies translations to the DOM, preserving the original text for toggling.
+(function () {
+  var ns = globalThis.__PLAMO__;
+  var log = ns.logger.log;
 
-export function applyTranslation(segment, translatedText) {
-  const el = segment.source && segment.source.element;
-  if (!el || typeof el.textContent !== 'string') return false;
+  function applyTranslation(el, translatedText, originalText) {
+    if (!el) return false;
+    if (el.dataset.plamoOriginal == null) {
+      el.dataset.plamoOriginal = originalText != null ? originalText : el.textContent;
+    } else if (el.textContent === el.dataset.plamoOriginal) {
+      el.dataset.plamoOriginal = originalText != null ? originalText : el.textContent;
+    }
+    el.textContent = translatedText;
+    el.classList.add('plamo-translated');
+    return true;
+  }
 
-  el.dataset.plamoId = segment.id;
-  el.dataset.plamoState = 'translated';
-  el.dataset.plamoOriginal = segment.text;
-  el.textContent = translatedText;
+  function restore(el) {
+    if (!el) return false;
+    var original = el.dataset.plamoOriginal;
+    if (original != null) {
+      el.textContent = original;
+      delete el.dataset.plamoOriginal;
+    }
+    el.classList.remove('plamo-translated');
+    return true;
+  }
 
-  segment.translatedText = translatedText;
-  segment.state = 'translated';
-  return true;
-}
-
-export function restoreOriginal(segment) {
-  const el = segment.source && segment.source.element;
-  if (!el) return false;
-
-  el.textContent = segment.text;
-  el.dataset.plamoState = 'untranslated';
-  delete el.dataset.plamoId;
-  delete el.dataset.plamoOriginal;
-
-  segment.state = 'untranslated';
-  return true;
-}
+  ns.renderer = {
+    applyTranslation: applyTranslation,
+    restore: restore
+  };
+})();

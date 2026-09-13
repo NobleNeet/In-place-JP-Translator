@@ -1,112 +1,91 @@
 // popup/popup.js
-// Minimal control panel. Reads/writes settings via chrome.storage.local and
-// drives the content script on the active tab.
+// Classic-script popup controller. Depends on: shared/settings.js, api/profiles.js
+// (loaded before this file in popup.html).
+(function () {
+  var ns = globalThis.__PLAMO__;
+  var loadSettings = ns.settings.loadSettings;
+  var saveSettings = ns.settings.saveSettings;
+  var clampConcurrent = ns.settings.clampConcurrent;
+  var profileNames = ns.profiles.profileNames;
+  var MSG_TRANSLATE_PAGE = ns.constants.MSG_TRANSLATE_PAGE;
+  var MSG_STOP = ns.constants.MSG_STOP;
 
-import { loadSettings, saveSettings, clampConcurrent } from '../shared/settings.js';
-import { profileNames } from '../api/profiles.js';
-import { MSG_TRANSLATE_PAGE, MSG_STOP } from '../shared/constants.js';
+  var $ = function (id) { return document.getElementById(id); };
+  var settings = {};
+  var status = 'idle';
+  var counts = { segments: 0, translated: 0, failed: 0 };
 
-const $ = (id) => document.getElementById(id);
-
-const els = {
-  translateBtn: $('translateBtn'),
-  stopBtn: $('stopBtn'),
-  profile: $('profile'),
-  mode: $('mode'),
-  concurrency: $('concurrency'),
-  state: $('state'),
-  segments: $('segments'),
-  translated: $('translated'),
-  failed: $('failed'),
-};
-
-let settings = await loadSettings();
-
-function populateProfiles() {
-  els.profile.innerHTML = '';
-  for (const name of profileNames()) {
-    const opt = document.createElement('option');
-    opt.value = name;
-    opt.textContent = name;
-    if (name === settings.profileName) opt.selected = true;
-    els.profile.appendChild(opt);
+  function render() {
+    if ($('status')) $('status').textContent = status;
+    if ($('segCount')) $('segCount').textContent = counts.segments;
+    if ($('transCount')) $('transCount').textContent = counts.translated;
+    if ($('failCount')) $('failCount').textContent = counts.failed;
+    var modeSel = $('mode');
+    if (modeSel && !ns.settings.isModeSupported(settings.mode)) modeSel.disabled = true;
   }
-}
 
-function renderSettings() {
-  els.profile.value = settings.profileName;
-  els.mode.value = settings.mode;
-  els.concurrency.value = String(settings.maxConcurrent);
-}
-
-function renderState(st) {
-  els.state.textContent = st.phase;
-  els.segments.textContent = st.segments;
-  els.translated.textContent = st.translated;
-  els.failed.textContent = st.failed;
-  const busy = st.phase === 'translating' || st.phase === 'extracting';
-  els.translateBtn.disabled = busy;
-  els.stopBtn.disabled = !busy;
-}
-
-function activeTab() {
-  return new Promise((resolve) => {
-    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => resolve(tabs && tabs[0]));
-  });
-}
-
-async function sendToTab(message) {
-  const tab = await activeTab();
-  if (!tab || !tab.id) {
-    els.state.textContent = 'No page (reload the page first)';
-    return;
-  }
-  chrome.tabs.sendMessage(tab.id, message, () => {
-    if (chrome.runtime.lastError) {
-      els.state.textContent = 'Page not ready (reload first)';
-      console.warn('[PLaMoTranslate]', chrome.runtime.lastError.message);
-    }
-  });
-}
-
-async function applySettings() {
-  const patch = {
-    profileName: els.profile.value,
-    mode: els.mode.value,
-    maxConcurrent: clampConcurrent(els.concurrency.value),
-  };
-  await saveSettings(patch);
-  settings = await loadSettings();
-}
-
-els.translateBtn.addEventListener('click', async () => {
-  await applySettings();
-  await sendToTab({ type: MSG_TRANSLATE_PAGE });
-});
-
-els.stopBtn.addEventListener('click', async () => {
-  await applySettings();
-  await sendToTab({ type: MSG_STOP });
-});
-
-els.profile.addEventListener('change', applySettings);
-els.mode.addEventListener('change', applySettings);
-els.concurrency.addEventListener('change', applySettings);
-
-// Live status updates from the content script.
-chrome.runtime.onMessage.addListener((msg) => {
-  if (msg && msg.type === MSG_STATUS && msg.state) renderState(msg.state);
-});
-
-populateProfiles();
-renderSettings();
-
-// Pull the current state from the active tab on open.
-chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-  const tab = tabs && tabs[0];
-  if (tab && tab.id) {
-    chrome.tabs.sendMessage(tab.id, { type: MSG_STATUS }, (resp) => {
-      if (resp && resp.state) renderState(resp.state);
+  function sendToTab(type) {
+    return new Promise(function (resolve, reject) {
+      chrome.tabs.query({ active: true, currentWindow: true }, function (tabs) {
+        if (!tabs || !tabs.length) { reject(new Error('No active tab')); return; }
+        chrome.tabs.sendMessage(tabs[0].id, { type: type }, function (response) {
+          if (chrome.runtime.lastError) { reject(new Error(chrome.runtime.lastError.message)); return; }
+          resolve(response);
+        });
+      });
     });
   }
-});
+
+  function renderStatus(s, c) {
+    status = s;
+    if (c) counts = c;
+    render();
+  }
+
+  function populateProfiles() {
+    var sel = $('profile');
+    profileNames().forEach(function (name) {
+      var opt = document.createElement('option');
+      opt.value = name;
+      opt.textContent = name;
+      sel.appendChild(opt);
+    });
+  }
+
+  function init() {
+    populateProfiles();
+    loadSettings().then(function (s) {
+      settings = s;
+      var profileSel = $('profile');
+      if (profileSel) profileSel.value = settings.profileName;
+      var concSel = $('concurrency');
+      if (concSel) concSel.value = String(clampConcurrent(settings.maxConcurrent));
+      render();
+    }).catch(function () { renderStatus('error'); });
+
+    $('translateBtn').addEventListener('click', function () {
+      renderStatus('translating');
+      sendToTab(MSG_TRANSLATE_PAGE).then(function () { setTimeout(function () { renderStatus('idle'); }, 500); })
+        .catch(function () { renderStatus('Page not ready (reload first)'); });
+    });
+
+    $('stopBtn').addEventListener('click', function () {
+      sendToTab(MSG_STOP).then(function () { renderStatus('idle'); }).catch(function () { renderStatus('error'); });
+    });
+
+    $('profile').addEventListener('change', function () {
+      settings.profileName = $('profile').value;
+      saveSettings({ profileName: settings.profileName });
+    });
+    $('mode').addEventListener('change', function () {
+      settings.mode = $('mode').value;
+      saveSettings({ mode: settings.mode });
+    });
+    $('concurrency').addEventListener('change', function () {
+      settings.maxConcurrent = clampConcurrent($('concurrency').value);
+      saveSettings({ maxConcurrent: settings.maxConcurrent });
+    });
+  }
+
+  document.addEventListener('DOMContentLoaded', init);
+})();

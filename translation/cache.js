@@ -1,35 +1,38 @@
 // translation/cache.js
-// Session-only in-memory cache: Map<originalText, translatedText>.
-// Structured so a persistent cache can be layered on later.
+// Classic-script module. Exports: ns.SessionCache
+// In-memory (session) cache: avoids re-translating the same English text.
+(function () {
+  var ns = globalThis.__PLAMO__;
+  var log = ns.logger.log;
 
-export class SessionCache {
-  constructor() {
+  function SessionCache() {
     this.map = new Map();
     this.hits = 0;
     this.misses = 0;
   }
 
-  has(text) {
-    return this.map.has(text);
+  function get(key) {
+    if (this.map.has(key)) {
+      this.hits++;
+      return this.map.get(key);
+    }
+    this.misses++;
+    return undefined;
   }
 
-  get(text) {
-    return this.map.get(text);
+  function set(key, value) {
+    this.map.set(key, value);
   }
 
-  set(text, translated) {
-    this.map.set(text, translated);
-  }
-
-  recordHit() {
-    this.hits += 1;
-  }
-
-  recordMiss() {
-    this.misses += 1;
-  }
-
-  clear() {
+  function clear() {
     this.map.clear();
+    this.hits = 0;
+    this.misses = 0;
   }
-}
+
+  SessionCache.prototype.get = get;
+  SessionCache.prototype.set = set;
+  SessionCache.prototype.clear = clear;
+
+  ns.SessionCache = SessionCache;
+})();

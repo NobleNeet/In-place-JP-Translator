@@ -59,8 +59,8 @@ you can load the directory directly in Developer mode.
 3. Click **Load unpacked** and select this project directory.
 4. Pin the PLaMo 2 Translator icon.
 
-> Requires a recent Vivaldi/Chromium (M102+) because the extension uses
-> ES-module content scripts and background service worker (`"type": "module"`).
+> Loads as classic scripts (no build step), so it works on any Chromium-based
+> Vivaldi without the `"type": "module"` content-script requirement.
 
 ---
 
@@ -150,7 +150,7 @@ Phase 5 compares these values against each other.
 
 ## Implemented features (Phase 1)
 
-- [x] Manifest V3 (Vivaldi/Chromium, ES modules)
+- [x] Manifest V3 (Vivaldi/Chromium, classic scripts, no build step)
 - [x] Manual "Translate Page" start from the popup
 - [x] Single API profile (`single` mode)
 - [x] OpenAI-compatible `/v1/chat/completions` client (separated layer)

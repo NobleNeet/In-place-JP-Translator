@@ -1,64 +1,85 @@
 // content/segmenter.js
-// Turns extracted readable fragments into translation segments with:
-//   - unique id
-//   - token estimate (loose heuristic)
-//   - language heuristic (skip obvious non-English)
-//   - viewport priority (visible / near / far)
-//   - a stable DOM source so results can be mapped back reliably.
+// Classic-script module. Exports: ns.segmenter
+// Splits readable elements into segments. Inlines merged into one segment.
+// English heuristic avoids translating Japanese-only text.
+(function () {
+  var ns = globalThis.__PLAMO__;
+  var log = ns.logger.log;
 
-const JAPANESE = /[㐀-鿿ぁ-んァ-ン]/; // kanji + hiragana + katakana
+  function estimateTokens(text) {
+    var len = String(text).length;
+    var cjk = (text.match(/[\u3400-\u9fff\uf900-\uffff]/g) || []).length;
+    var nonCjk = len - cjk;
+    return Math.ceil(cjk + nonCjk / 4);
+  }
 
-let counter = 0;
-export function makeSegmentId() {
-  counter += 1;
-  return `segment-${Date.now().toString(36)}-${counter}`;
-}
+  function isLikelyEnglish(text) {
+    if (!text) return false;
+    var letters = text.replace(/[^A-Za-z]/g, '');
+    if (letters.length === 0) return false;
+    var ratio = letters.length / text.length;
+    return ratio >= 0.3;
+  }
 
-// 1 token ~= 4 characters (English). Separated as its own function so the
-// heuristic can be replaced with a real tokenizer later.
-export function estimateTokens(text, charPerToken = 4) {
-  const len = (text || '').length;
-  return Math.max(1, Math.ceil(len / Math.max(1, charPerToken | 0)));
-}
+  function mergeInlines(el) {
+    var texts = [];
+    texts.push(el.textContent.trim());
+    el.querySelectorAll('a, strong, em, b, i, span, code').forEach(function (child) {
+      texts.push(child.textContent.trim());
+    });
+    var merged = texts.join(' ').replace(/\s+/g, ' ').trim();
+    return merged;
+  }
 
-// Lightweight English heuristic. Text with kana/kanji is skipped as already
-// Japanese; pure numbers/symbols are skipped; mixed Latin+numbers/proper
-// nouns (e.g. "Version 2.1 supports Linux.") are kept.
-export function isLikelyEnglish(text) {
-  const t = (text || '').trim();
-  if (t.length < 2) return false;
-  if (JAPANESE.test(t)) return false;
-  const letters = (t.match(/[A-Za-z]/g) || []).length;
-  if (letters === 0) return false;
-  return letters / t.length >= 0.3;
-}
-
-function computePriority(el) {
-  let rect;
-  try {
-    rect = el.getBoundingClientRect();
-  } catch {
+  function viewportPriority(el) {
+    if (!el.getBoundingClientRect) return 3;
+    var r = el.getBoundingClientRect();
+    if (r.top < window.innerHeight && r.bottom > 0) return 1;
+    var d = Math.min(Math.abs(r.top - window.innerHeight), Math.abs(r.bottom));
+    if (d < 400) return 2;
     return 3;
   }
-  if (rect.width === 0 && rect.height === 0) return 3;
-  const viewBottom = Math.max(window.innerHeight || 0, document.documentElement.clientHeight || 0);
-  if (rect.top < viewBottom) return 1; // currently visible
-  if (rect.top < viewBottom * 1.5) return 2; // just below the fold
-  return 3; // further down
-}
 
-export function buildSegments(readables) {
-  const segments = [];
-  for (const { element, text } of readables) {
-    if (!isLikelyEnglish(text)) continue;
-    segments.push({
-      id: makeSegmentId(),
-      text,
-      tokenEstimate: estimateTokens(text),
-      priority: computePriority(element),
-      state: 'untranslated',
-      source: { element, renderMode: 'textContent' },
+  function buildSegments(root, opts) {
+    opts = opts || {};
+    var elements = opts.elements || ns.extractor.extractReadableElements(root);
+    var segments = [];
+    var id = 0;
+    elements.forEach(function (el) {
+      var text = mergeInlines(el);
+      if (!text) return;
+      if (!opts.includeNonEnglish && !isLikelyEnglish(text)) return;
+      segments.push({
+        id: 'seg-' + (id++),
+        text: text,
+        estimatedTokens: estimateTokens(text),
+        viewport: viewportPriority(el),
+        source: { element: el, tagName: el.tagName, id: id }
+      });
+    });
+    log.debug('segmenter: built ' + segments.length + ' segments');
+    return segments;
+  }
+
+  function sortSegmentsByViewport(segments) {
+    var vp = function (el) {
+      if (!el.getBoundingClientRect) return 0;
+      var r = el.getBoundingClientRect();
+      if (r.top < window.innerHeight && r.bottom > 0) return 1;
+      var d = Math.min(Math.abs(r.top - window.innerHeight), Math.abs(r.bottom));
+      if (d < 400) return 2;
+      return 3;
+    };
+    return segments.slice().sort(function (a, b) {
+      var av = vp(a.source.element), bv = vp(b.source.element);
+      return (av - bv) || (a.source.id - b.source.id);
     });
   }
-  return segments;
-}
+
+  ns.segmenter = {
+    buildSegments: buildSegments,
+    sortSegmentsByViewport: sortSegmentsByViewport,
+    isLikelyEnglish: isLikelyEnglish,
+    estimateTokens: estimateTokens
+  };
+})();

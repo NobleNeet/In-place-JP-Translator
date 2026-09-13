@@ -13,16 +13,34 @@
     "default_title": "PLaMo 2 Translator"
   },
   "background": {
-    "service_worker": "background/background.js",
-    "type": "module"
+    "service_worker": [
+      "shared/logger.js",
+      "api/profiles.js",
+      "api/openai-client.js",
+      "translation/scheduler.js",
+      "shared/constants.js",
+      "background/background.js"
+    ]
   },
   "content_scripts": [
     {
       "matches": ["*://*/*"],
       "run_at": "document_idle",
       "all_frames": false,
-      "js": ["content/content.js"],
-      "type": "module"
+      "js": [
+        "shared/logger.js",
+        "shared/constants.js",
+        "shared/settings.js",
+        "api/profiles.js",
+        "api/openai-client.js",
+        "content/extractor.js",
+        "content/segmenter.js",
+        "content/renderer.js",
+        "translation/batcher.js",
+        "translation/cache.js",
+        "translation/queue.js",
+        "content/content.js"
+      ]
     }
   ]
 }

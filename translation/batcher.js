@@ -1,30 +1,52 @@
 // translation/batcher.js
-// Groups segments into batches bounded by count and estimated token size.
-// Settings are injected so the limits are fully tunable (see constants.js).
+// Classic-script module. Exports: ns.createBatcher
+// Groups segments into batches with soft bounds: max count and max estimated
+// tokens. A segment larger than the token cap starts its own batch.
+(function () {
+  var ns = globalThis.__PLAMO__;
+  var BATCH_SETTINGS = ns.constants.BATCH_SETTINGS;
 
-import { BATCH_SETTINGS } from '../shared/constants.js';
+  function createBatcher(opts) {
+    var maxSegmentsPerBatch = opts && opts.maxSegmentsPerBatch != null
+      ? opts.maxSegmentsPerBatch : BATCH_SETTINGS.maxSegmentsPerBatch;
+    var maxTokensPerBatch = opts && opts.maxEstimatedTokensPerBatch != null
+      ? opts.maxEstimatedTokensPerBatch : BATCH_SETTINGS.maxEstimatedTokensPerBatch;
+    var charPerToken = opts && opts.charPerToken != null
+      ? opts.charPerToken : BATCH_SETTINGS.charPerToken;
 
-export function createBatcher(settings = {}) {
-  const cfg = { ...BATCH_SETTINGS, ...settings };
-
-  return function batch(segments) {
-    const batches = [];
-    let current = [];
-    let tokens = 0;
-
-    for (const seg of segments) {
-      const t = seg.tokenEstimate || 0;
-      const overCount = current.length + 1 > cfg.maxSegmentsPerBatch;
-      const overTokens = tokens + t > cfg.maxEstimatedTokensPerBatch;
-      if (current.length > 0 && (overCount || overTokens)) {
-        batches.push(current);
-        current = [];
-        tokens = 0;
-      }
-      current.push(seg);
-      tokens += t;
+    function estimateTokens(text) {
+      var len = String(text || '').length;
+      var cjk = (text.match(/[\u3400-\u9fff\uf900-\uffff]/g) || []).length;
+      var nonCjk = len - cjk;
+      return Math.ceil(cjk + nonCjk / charPerToken);
     }
-    if (current.length > 0) batches.push(current);
-    return batches;
-  };
-}
+
+    function batch(segments) {
+      var batches = [];
+      var i = 0;
+      while (i < segments.length) {
+        var seg = segments[i];
+        if (estimateTokens(seg.text) > maxTokensPerBatch) {
+          batches.push({ segments: [seg], estimatedTokens: estimateTokens(seg.text) });
+          i++;
+          continue;
+        }
+        var curSegs = [seg];
+        var curTok = estimateTokens(seg.text);
+        var j = i + 1;
+        while (j < segments.length && curSegs.length < maxSegmentsPerBatch && curTok + estimateTokens(segments[j].text) <= maxTokensPerBatch) {
+          curTok += estimateTokens(segments[j].text);
+          curSegs.push(segments[j]);
+          j++;
+        }
+        batches.push({ segments: curSegs, estimatedTokens: curTok });
+        i = j;
+      }
+      return batches;
+    }
+
+    return { batch: batch, estimateTokens: estimateTokens };
+  }
+
+  ns.createBatcher = createBatcher;
+})();

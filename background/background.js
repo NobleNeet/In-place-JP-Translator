@@ -1,94 +1,105 @@
 // background/background.js
-// Centralizes all OpenAI-compatible API access.
-// Content scripts never touch the network directly.
+// Classic-script background worker. Loads in order:
+// logger, api/profiles, api/openai-client, translation/scheduler, constants.
 //
-// Each incoming batch becomes one or more API tasks (1 segment = 1 task in
-// this phase), executed with bounded concurrency (Semaphore), a hard timeout,
-// and per-task error isolation.
+// Centralizes ALL API access so the page never talks to the API directly
+// (keeps page secrets out of the request body). Translates a batch of
+// segments in parallel, bounded by concurrency, with per-request timeout,
+// error classification, and per-segment isolation.
+(function () {
+  var ns = globalThis.__PLAMO__;
 
-import { log } from '../shared/logger.js';
-import { getProfile } from '../api/profiles.js';
-import { translateSegment } from '../api/openai-client.js';
-import { Semaphore } from '../translation/scheduler.js';
-import { MSG_TRANSLATE, MSG_STOP, DEFAULT_MAX_CONCURRENT, DEFAULT_TIMEOUT_MS } from '../shared/constants.js';
+  var log = ns.logger.log;
+  var MSG_TRANSLATE = ns.constants.MSG_TRANSLATE;
+  var MSG_STATUS = ns.constants.MSG_STATUS;
 
-const appController = new AbortController();
-let semaphore = new Semaphore(DEFAULT_MAX_CONCURRENT);
-let maxConcurrent = DEFAULT_MAX_CONCURRENT;
-let aborted = false;
+  var semaphore = new ns.Semaphore(ns.constants.DEFAULT_MAX_CONCURRENT);
+  var profiles = ns.profiles;
+  var translateSegment = ns.openaiClient.translateSegment;
 
-function runTask(profile, segment) {
-  return semaphore
-    .acquire()
-    .then(() => {
-      const t0 = performance.now();
-      return translateSegment(profile, segment, {
-        timeoutMs: DEFAULT_TIMEOUT_MS,
-        signal: appController.signal,
-      }).then((res) => ({
-        ...res,
-        id: segment.id,
-        elapsedMs: Math.round(performance.now() - t0),
-      }));
-    })
-    .finally(() => semaphore.release());
-}
+  async function translateBatch(batch, profileName, concurrency, timeoutMs, cache) {
+    var profile = profiles.getProfile(profileName);
+    log.debug('translateBatch start: ' + batch.segments.length + ' segments, est ' + batch.estimatedTokens + ' tokens, profile=' + profile.name + ', concurrency=' + concurrency);
+    var t0 = performance.now();
+    var results = {};
+    var translated = 0, failed = 0, cacheHits = 0;
 
-async function handleTranslate(msg, sendResponse) {
-  if (aborted) {
-    sendResponse({ ok: false, error: 'stopped', profileName: null });
-    return;
+    var tasks = batch.segments.map(function (segment) {
+      return semaphore.run(function () {
+        return new Promise(function (resolve) {
+          var cached = cache.get(segment.text);
+          if (cached != null) {
+            cacheHits++;
+            results[segment.id] = { id: segment.id, text: segment.text, translatedText: cached };
+            translated++;
+            resolve();
+            return;
+          }
+
+          var done = false;
+          var timer = setTimeout(function () {
+            if (done) return;
+            done = true;
+            results[segment.id] = { id: segment.id, text: segment.text, error: 'Request timed out', errorType: 'timeout' };
+            failed++;
+            resolve();
+          }, timeoutMs);
+
+          translateSegment(profile, segment, { timeoutMs: timeoutMs }).then(function (res) {
+            if (done) return;
+            done = true;
+            clearTimeout(timer);
+            if (res.translatedText) {
+              results[segment.id] = { id: segment.id, text: segment.text, translatedText: res.translatedText };
+              cache.set(segment.text, res.translatedText);
+              translated++;
+            } else {
+              results[segment.id] = { id: segment.id, text: segment.text, error: res.error, errorType: res.errorType };
+              failed++;
+            }
+            resolve();
+          }).catch(function (err) {
+            if (done) return;
+            done = true;
+            clearTimeout(timer);
+            results[segment.id] = { id: segment.id, text: segment.text, error: String(err && err.message || err), errorType: 'connection' };
+            failed++;
+            resolve();
+          });
+        });
+      });
+    });
+
+    await Promise.all(tasks);
+    var elapsedMs = Math.round(performance.now() - t0);
+    var status = failed === 0 ? 'success' : (translated === 0 ? 'failure' : 'partial');
+    log.debug('translateBatch done: translated=' + translated + ' failed=' + failed + ' cacheHits=' + cacheHits + ' ' + elapsedMs + 'ms');
+    return {
+      profile: profile.name,
+      segments: batch.segments.length,
+      estimatedTokens: batch.estimatedTokens,
+      elapsedMs: elapsedMs,
+      results: results,
+      translated: translated,
+      failed: failed,
+      cacheHits: cacheHits,
+      status: status
+    };
   }
 
-  const profileName = msg.profileName || 'evo-x2-plamo2';
-  const profile = getProfile(profileName);
-  const segments = msg.segments || [];
-  const maxC = Math.max(1, (msg.maxConcurrent || maxConcurrent) | 0);
-  maxConcurrent = maxC;
-  semaphore.update(maxC);
-
-  const estTokens = segments.reduce((sum, seg) => sum + (seg.tokenEstimate || 0), 0);
-  const tStart = performance.now();
-
-  const results = await Promise.all(segments.map((seg) => runTask(profile, seg)));
-
-  const elapsedMs = Math.round(performance.now() - tStart);
-  const succeeded = results.filter((r) => r.translatedText).length;
-  const failed = results.length - succeeded;
-
-  log.batch({
-    batch: (handleTranslate.batchId = (handleTranslate.batchId || 0) + 1),
-    server: profile.name,
-    segments: segments.length,
-    estimatedTokens: estTokens,
-    elapsedMs,
-    status: failed === 0 ? 'success' : failed === results.length ? 'failure' : 'partial',
+  chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
+    if (!msg || !msg.type) { sendResponse({ error: 'unknown message type' }); return; }
+    if (msg.type === MSG_TRANSLATE) {
+      var p = translateBatch(msg.batch, msg.profileName, msg.concurrency, msg.timeoutMs, msg.cache || new Map());
+      p.then(function (res) { sendResponse(res); }, function (err) { log.error('translateBatch error', err); sendResponse({ segments: (msg.batch && msg.batch.segments ? msg.batch.segments.length : 0), error: String(err && err.message || err), status: 'failure' }); });
+      return;
+    }
+    if (msg.type === MSG_STATUS) {
+      sendResponse({ phase: 'idle', segments: 0, translated: 0, failed: 0 });
+      return;
+    }
+    sendResponse({ error: 'unknown message type' });
   });
 
-  sendResponse({
-    ok: true,
-    profileName: profile.name,
-    count: results.length,
-    results,
-    elapsedMs,
-  });
-}
-
-function handleStop() {
-  aborted = true;
-  appController.abort();
-  log.warn('translation stopped by user');
-}
-
-chrome.runtime.onMessage.addListener((msg, sendResponse) => {
-  if (msg && msg.type === MSG_TRANSLATE) {
-    handleTranslate(msg, sendResponse);
-    return true;
-  }
-  if (msg && msg.type === MSG_STOP) {
-    handleStop();
-    sendResponse({ ok: true });
-    return true;
-  }
-  return false;
-});
+  chrome.runtime.onInstalled.addListener(function () { log.info('installed', { version: chrome.runtime.getManifest().version }); });
+})();

@@ -1,197 +1,164 @@
 // content/content.js
-// Page orchestrator:
-//   extract -> segment -> (cache) -> priority order -> batch ->
-//   send to background -> map results by id -> apply to DOM -> metrics.
+// Classic-script orchestrator. Runs in the page's content-script scope.
+// Loads in order: logger, constants, settings, profiles, openai-client,
+// extractor, segmenter, renderer, batcher, cache, queue.
 //
-// The API is never called from here; all network access goes through the
-// background service worker.
+// Flow: extract readable elements -> build segments -> order by viewport
+// priority -> batch -> send each batch to background (in parallel, concurrency
+// bound) -> apply each finished batch to the DOM as it completes.
+(function () {
+  var ns = globalThis.__PLAMO__;
 
-import { log } from '../shared/logger.js';
-import { extractReadableElements } from './extractor.js';
-import { buildSegments } from './segmenter.js';
-import { applyTranslation } from './renderer.js';
-import { createBatcher } from '../translation/batcher.js';
-import { SessionCache } from '../translation/cache.js';
-import { MSG_TRANSLATE_PAGE, MSG_STOP, MSG_STATUS } from '../shared/constants.js';
-import { loadSettings } from '../shared/settings.js';
+  var log = ns.logger.log;
+  var MSG_TRANSLATE_PAGE = ns.constants.MSG_TRANSLATE_PAGE;
+  var MSG_STOP = ns.constants.MSG_STOP;
+  var MSG_STATUS = ns.constants.MSG_STATUS;
+  var MSG_TRANSLATE = ns.constants.MSG_TRANSLATE;
 
-const batcher = createBatcher();
-const cache = new SessionCache();
+  var extractReadableElements = ns.extractor.extractReadableElements;
+  var buildSegments = ns.segmenter.buildSegments;
+  var sortSegmentsByViewport = ns.segmenter.sortSegmentsByViewport;
+  var applyTranslation = ns.renderer.applyTranslation;
+  var restore = ns.renderer.restore;
+  var createBatcher = ns.createBatcher;
+  var SessionCache = ns.SessionCache;
+  var loadSettings = ns.settings.loadSettings;
+  var getProfile = ns.profiles.getProfile;
+  var translateSegment = ns.openaiClient.translateSegment;
 
-const state = {
-  phase: 'idle', // idle | extracting | translating | completed | error
-  aborted: false,
-  segments: 0,
-  translated: 0,
-  failed: 0,
-  cacheHits: 0,
-};
+  var settings = {};
+  var batcher = createBatcher(settings.batch || {});
+  var cache = new SessionCache();
+  var inFlight = {};
+  var abortRequested = false;
 
-let settings = await loadSettings();
-let appController = new AbortController();
-let batchId = 0;
-let firstTranslatedAt = 0;
-let firstViewportAt = 0;
-
-// Exposed on window for manual inspection from devtools.
-window.__plamo = {
-  getState: () => state,
-  getCache: () => cache,
-  getSettings: () => settings,
-};
-
-function broadcastStatus() {
-  chrome.runtime.sendMessage({ type: MSG_STATUS, state: { ...state } });
-}
-
-function setPhase(phase) {
-  state.phase = phase;
-  broadcastStatus();
-}
-
-async function translatePage() {
-  if (state.phase === 'translating') return;
-
-  appController = new AbortController();
-  state.aborted = false;
-
-  // Read fresh settings so popup changes (profile/concurrency) take effect.
-  settings = await loadSettings();
-
-  setPhase('extracting');
-  const tAll = performance.now();
-
-  const readables = extractReadableElements(document);
-  const allSegments = buildSegments(readables);
-
-  // Cache hits are applied without any API call.
-  let toTranslate = [];
-  for (const seg of allSegments) {
-    if (cache.has(seg.text)) {
-      if (applyTranslation(seg, cache.get(seg.text))) {
-        state.translated += 1;
-        cache.recordHit();
-        state.cacheHits += 1;
-      }
-      continue;
-    }
-    cache.recordMiss();
-    toTranslate.push(seg);
+  function setStatus(status) {
+    try { chrome.runtime.sendMessage({ type: MSG_STATUS, status: status }); }
+    catch (e) { /* background may not be listening yet */ }
   }
 
-  // Priority order: currently visible first, then near, then the rest.
-  toTranslate.sort((a, b) => (a.priority - b.priority) || (allSegments.indexOf(a) - allSegments.indexOf(b)));
-
-  const batches = batcher(toTranslate);
-  state.segments = toTranslate.length;
-  setPhase('translating');
-
-  log.info(`start: ${toTranslate.length} segments in ${batches.length} batch(es)`, {
-    byPriority: {
-      visible: toTranslate.filter((s) => s.priority === 1).length,
-      near: toTranslate.filter((s) => s.priority === 2).length,
-      other: toTranslate.filter((s) => s.priority === 3).length,
-    },
-  });
-
-  for (const batchSegs of batches) {
-    if (appController.signal.aborted) break;
-
-    const estTokens = batchSegs.reduce((sum, s) => sum + (s.tokenEstimate || 0), 0);
-    const t0 = performance.now();
-    const res = await requestTranslate(batchSegs);
-    const elapsedMs = Math.round(performance.now() - t0);
-
-    batchId += 1;
-    log.batch({
-      batch: batchId,
-      server: res.profileName || 'none',
-      segments: batchSegs.length,
-      estimatedTokens: estTokens,
-      elapsedMs,
-      status: res.ok ? 'success' : 'failure',
-    });
-
-    for (const r of res.results) {
-      const seg = batchSegs.find((x) => x.id === r.id);
-      if (!seg) {
-        log.error(`segment/response mismatch: ${r.id}`);
-        continue;
-      }
-      if (r.error) {
-        seg.state = 'failed';
-        state.failed += 1;
-        log.warn(`failed ${seg.id} [${r.errorType}] ${r.error}`);
-      } else {
-        if (firstTranslatedAt === 0) firstTranslatedAt = performance.now() - tAll;
-        applyTranslation(seg, r.translatedText);
-        cache.set(seg.text, r.translatedText);
-        state.translated += 1;
-        if (seg.priority <= 2 && firstViewportAt === 0) firstViewportAt = performance.now() - tAll;
-      }
-    }
-  }
-
-  setPhase(state.aborted ? 'idle' : 'completed');
-
-  log.info('done', {
-    total: state.segments,
-    translated: state.translated,
-    failed: state.failed,
-    cacheHits: state.cacheHits,
-    elapsedMs: Math.round(performance.now() - tAll),
-    firstTranslatedLatencyMs: firstTranslatedAt,
-    firstViewportLatencyMs: firstViewportAt,
-  });
-}
-
-function requestTranslate(segments) {
-  return new Promise((resolve) => {
-    chrome.runtime.sendMessage(
-      {
-        type: MSG_TRANSLATE,
-        profileName: settings.profileName,
-        mode: settings.mode,
-        maxConcurrent: settings.maxConcurrent,
-        segments,
-      },
-      (resp) => {
-        if (resp && resp.ok) {
-          resolve({ ok: true, profileName: resp.profileName, results: resp.results });
-          return;
-        }
-        log.warn('translate response ok=false', resp && resp.error);
-        resolve({
-          ok: false,
-          profileName: null,
-          results: segments.map((s) => ({
-            id: s.id,
-            error: resp ? resp.error || 'no response' : 'no response',
-            errorType: 'no_response',
-          })),
+  function sendToTab(msg) {
+    return new Promise(function (resolve, reject) {
+      try {
+        chrome.runtime.sendMessage(msg, function (response) {
+          if (chrome.runtime.lastError) { reject(new Error(chrome.runtime.lastError.message)); return; }
+          resolve(response);
         });
-      },
-    );
+      } catch (e) { reject(e); }
+    });
+  }
+
+  function translatePage(root) {
+    abortRequested = false;
+    setStatus('translating');
+    return loadSettings().then(function (s) {
+      settings = s; // apply popup changes immediately
+      var segments = buildSegments(root || document);
+      log.info('start: ' + segments.length + ' segments', { byPriority: countViewport(segments) });
+      if (!segments.length) { setStatus('idle'); return { total: 0, translated: 0, failed: 0, cacheHits: 0, elapsedMs: 0, firstTranslatedLatencyMs: 0, firstViewportLatencyMs: 0 }; }
+
+      segments = sortSegmentsByViewport(segments);
+      var batches = batcher.batch(segments);
+      var t0 = performance.now();
+      var translated = 0, failed = 0, cacheHits = 0;
+      var inFlightIds = {};
+      var firstTranslatedLatencyMs = 0, firstViewportLatencyMs = 0;
+      var viewportId = null;
+      segments.forEach(function (s) { if (s.viewport === 1 && !viewportId) viewportId = s.id; });
+
+      var results = {};
+      var promises = batches.map(function (batch, batchIndex) {
+        inFlightIds[batchIndex] = true;
+        return sendToTab({ type: MSG_TRANSLATE, batch: batch, profile: settings.profileName, concurrency: settings.maxConcurrent, timeoutMs: ns.constants.DEFAULT_TIMEOUT_MS, cache: cache.map }).then(function (res) {
+          delete inFlightIds[batchIndex];
+          var server = (res && res.profile) ? res.profile : 'unknown';
+          if (res && res.status === 'success') {
+            translated += res.segments;
+            cacheHits += res.cacheHits || 0;
+            var first = (res.results && res.results[0]) || null;
+            if (first && first.translatedText) {
+              if (!firstTranslatedLatencyMs) firstTranslatedLatencyMs = Math.round(performance.now() - t0);
+              if (first.id === viewportId && !firstViewportLatencyMs) firstViewportLatencyMs = Math.round(performance.now() - t0);
+            }
+            Object.keys(res.results).forEach(function (id) { results[id] = res.results[id]; });
+            log.batch({ batch: batchIndex + 1, server: server, segments: res.segments, estimatedTokens: batch.estimatedTokens, elapsedMs: res.elapsedMs, status: 'success' });
+          } else if (res && res.status === 'partial') {
+            var done = 0;
+            Object.keys(res.results).forEach(function (id) { results[id] = res.results[id]; if (res.results[id].translatedText) done++; });
+            translated += done; failed += res.segments - done;
+            log.batch({ batch: batchIndex + 1, server: server, segments: res.segments, estimatedTokens: batch.estimatedTokens, elapsedMs: res.elapsedMs, status: 'partial' });
+          } else {
+            failed += res.segments;
+            log.batch({ batch: batchIndex + 1, server: server, segments: res.segments, estimatedTokens: batch.estimatedTokens, elapsedMs: res.elapsedMs, status: 'failure', error: res.error });
+          }
+        }).catch(function (err) {
+          delete inFlightIds[batchIndex];
+          failed += batch.segments.length;
+          log.error('translate response err', err);
+        });
+      });
+
+      return Promise.all(promises).then(function () {
+        Object.keys(results).forEach(function (id) {
+          var r = results[id];
+          if (r && r.translatedText && r.source && r.source.element) {
+            applyTranslation(r.source.element, r.translatedText, r.source.text);
+          }
+        });
+        var elapsedMs = Math.round(performance.now() - t0);
+        setStatus('idle');
+        log.info('done', { total: segments.length, translated: translated, failed: failed, cacheHits: cacheHits, elapsedMs: elapsedMs, firstTranslatedLatencyMs: firstTranslatedLatencyMs, firstViewportLatencyMs: firstViewportLatencyMs });
+        return { total: segments.length, translated: translated, failed: failed, cacheHits: cacheHits, elapsedMs: elapsedMs, firstTranslatedLatencyMs: firstTranslatedLatencyMs, firstViewportLatencyMs: firstViewportLatencyMs };
+      });
+    });
+  }
+
+  function countViewport(segments) {
+    var visible = 0, near = 0, rest = 0;
+    segments.forEach(function (s) {
+      if (s.viewport === 1) visible++;
+      else if (s.viewport === 2) near++;
+      else rest++;
+    });
+    return { visible: visible, near: near, other: rest };
+  }
+
+  function handleMessage(request) {
+    if (!request || !request.type) return Promise.resolve({ error: 'unknown message type' });
+    if (request.type === MSG_TRANSLATE) {
+      var root = request.root;
+      return translatePage(root);
+    }
+    if (request.type === MSG_STOP) {
+      abortRequested = true;
+      setStatus('idle');
+      return Promise.resolve({ ok: true, aborted: true });
+    }
+    if (request.type === MSG_STATUS) {
+      return Promise.resolve({ phase: abortRequested ? 'idle' : 'translating', segments: 0, translated: 0, failed: 0, cacheHits: 0 });
+    }
+    return Promise.resolve({ error: 'unknown message type' });
+  }
+
+  chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
+    var p = handleMessage(msg);
+    if (p && p.then) {
+      p.then(function (res) { sendResponse(res); }, function (err) { log.error('message handler error', err); sendResponse({ error: String(err && err.message || err) }); return true; });
+      return true;
+    }
+    sendResponse(p);
+    return true;
   });
-}
 
-function stopTranslation() {
-  state.aborted = true;
-  appController.abort();
-  log.info('user requested stop');
-}
+  window.__plamo = {
+    getState: function () {
+      return { phase: abortRequested ? 'idle' : 'translating', segments: 0, translated: 0, failed: 0, cacheHits: 0, abortRequested: abortRequested };
+    },
+    getCache: function () { return { mapSize: cache.map.size, hits: cache.hits, misses: cache.misses }; },
+    getSettings: function () { return settings; },
+    translatePage: function (root) { return translatePage(root); },
+    translateSegment: function (segment, opts) { return translateSegment(getProfile(settings.profileName), segment, opts); }
+  };
 
-chrome.runtime.onMessage.addListener((msg) => {
-  if (msg && msg.type === MSG_TRANSLATE_PAGE) {
-    translatePage();
-    return true;
-  }
-  if (msg && msg.type === MSG_STOP) {
-    stopTranslation();
-    return true;
-  }
-  if (msg && msg.type === MSG_STATUS) {
-    return true;
-  }
-  return false;
-});
+  setStatus('idle');
+})();

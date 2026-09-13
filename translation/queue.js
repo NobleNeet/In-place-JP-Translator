@@ -1,29 +1,35 @@
 // translation/queue.js
-// Simple ordered queue consumed by the content orchestrator.
-// The actual priority ordering is done before batching in content.js.
+// Classic-script module. Exports: ns.Queue
+// Priority queue for pending work items (used in Phase 2 for viewport-driven
+// streaming). Not used in Phase 1 (we translate top-level priority order).
+(function () {
+  var ns = globalThis.__PLAMO__;
+  var log = ns.logger.log;
 
-export class TranslationQueue {
-  constructor() {
-    this.items = [];
+  function Queue() {
+    this._items = [];
   }
 
-  push(item) {
-    this.items.push(item);
-  }
+  Queue.prototype.enqueue = function (item) {
+    this._items.push(item);
+    this._items.sort(function (a, b) { return a.priority - b.priority; });
+  };
 
-  next() {
-    return this.items.shift();
-  }
+  Queue.prototype.dequeue = function () {
+    return this._items.shift();
+  };
 
-  peek() {
-    return this.items[0];
-  }
+  Queue.prototype.peek = function () {
+    return this._items[0];
+  };
 
-  get size() {
-    return this.items.length;
-  }
+  Queue.prototype.size = function () {
+    return this._items.length;
+  };
 
-  clear() {
-    this.items = [];
-  }
-}
+  Queue.prototype.clear = function () {
+    this._items = [];
+  };
+
+  ns.Queue = Queue;
+})();
