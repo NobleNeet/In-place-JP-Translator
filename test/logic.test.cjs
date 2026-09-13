@@ -27,7 +27,8 @@ const sandbox = {
   Number, JSON, parseInt, Math, AbortController, setTimeout, clearTimeout,
   fetch: async () => ({ ok: true, json: async () => ({ choices: [{ message: { content: 'test' } }] }), text: async () => '' }),
   chrome: chromeFake,
-  window: {}, document: { createTreeWalker: () => ({ nextNode: () => null }), addEventListener: () => {} }
+  window: {}, document: { createTreeWalker: () => ({ nextNode: () => null }), addEventListener: () => {} },
+  importScripts: () => {}
 };
 sandbox.globalThis = sandbox;
 const ctx = vm.createContext(sandbox);

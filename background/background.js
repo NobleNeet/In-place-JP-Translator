@@ -6,6 +6,19 @@
 // (keeps page secrets out of the request body). Translates a batch of
 // segments in parallel, bounded by concurrency, with per-request timeout,
 // error classification, and per-segment isolation.
+//
+// MV3 allows only one service-worker entry file. The shared modules needed by
+// the background are loaded here into the same global scope via importScripts
+// (logger, constants, profiles, openai-client, scheduler) so globalThis.__PLAMO__
+// is populated before the IIFE below runs.
+importScripts(
+  '../shared/logger.js',
+  '../shared/constants.js',
+  '../api/profiles.js',
+  '../api/openai-client.js',
+  '../translation/scheduler.js'
+);
+
 (function () {
   var ns = globalThis.__PLAMO__;
 

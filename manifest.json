@@ -13,14 +13,7 @@
     "default_title": "PLaMo 2 Translator"
   },
   "background": {
-    "service_worker": "background/background.js",
-    "scripts": [
-      "shared/logger.js",
-      "api/profiles.js",
-      "api/openai-client.js",
-      "translation/scheduler.js",
-      "shared/constants.js"
-    ]
+    "service_worker": "background/background.js"
   },
   "content_scripts": [
     {
