@@ -69,7 +69,7 @@
       var results = {};
       var promises = batches.map(function (batch, batchIndex) {
         inFlightIds[batchIndex] = true;
-        return sendToTab({ type: MSG_TRANSLATE, batch: batch, profile: settings.profileName, concurrency: settings.maxConcurrent, timeoutMs: ns.constants.DEFAULT_TIMEOUT_MS, cache: cache.map }).then(function (res) {
+        return sendToTab({ type: MSG_TRANSLATE, batch: batch, profileName: settings.profileName, concurrency: settings.maxConcurrent, timeoutMs: ns.constants.DEFAULT_TIMEOUT_MS, cache: cache.map }).then(function (res) {
           delete inFlightIds[batchIndex];
           var server = (res && res.profile) ? res.profile : 'unknown';
           if (res && res.status === 'success') {

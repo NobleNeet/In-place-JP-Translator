@@ -103,7 +103,7 @@ importScripts(
   chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
     if (!msg || !msg.type) { sendResponse({ error: 'unknown message type' }); return; }
     if (msg.type === MSG_TRANSLATE) {
-      var p = translateBatch(msg.batch, msg.profileName, msg.concurrency, msg.timeoutMs, msg.cache || new Map());
+      var p = translateBatch(msg.batch, msg.profileName || msg.profile, msg.concurrency, msg.timeoutMs, msg.cache || new Map());
       p.then(function (res) { sendResponse(res); }, function (err) { log.error('translateBatch error', err); sendResponse({ segments: (msg.batch && msg.batch.segments ? msg.batch.segments.length : 0), error: String(err && err.message || err), status: 'failure' }); });
       return;
     }
