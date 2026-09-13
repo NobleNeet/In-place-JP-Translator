@@ -27,7 +27,8 @@
 
   function collectTextNodes(root) {
     var nodes = [];
-    var walker = root.ownerDocument.createTreeWalker(root, NodeFilter.SHOW_ELEMENT, {
+    var doc = root.ownerDocument || root;
+    var walker = doc.createTreeWalker(root, NodeFilter.SHOW_ELEMENT, {
       acceptElement: function (el) {
         if (el !== root && shouldIgnore(el)) return NodeFilter.FILTER_REJECT;
         return NodeFilter.FILTER_ACCEPT;
