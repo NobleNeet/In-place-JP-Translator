@@ -29,7 +29,7 @@
     var nodes = [];
     var doc = root.ownerDocument || root;
     var walker = doc.createTreeWalker(root, NodeFilter.SHOW_ELEMENT, {
-      acceptElement: function (el) {
+      acceptNode: function (el) {
         if (el !== root && shouldIgnore(el)) return NodeFilter.FILTER_REJECT;
         return NodeFilter.FILTER_ACCEPT;
       }
