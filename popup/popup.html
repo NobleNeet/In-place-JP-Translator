@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <link rel="stylesheet" href="popup.css" />
+  <title>PLaMo 2 Translator</title>
+</head>
+<body>
+  <h1>PLaMo 2 Translator</h1>
+
+  <div class="row actions">
+    <button id="translateBtn" class="primary">Translate Page</button>
+    <button id="stopBtn" disabled>Stop Translation</button>
+  </div>
+
+  <div class="row">
+    <label>API profile
+      <select id="profile"></select>
+    </label>
+  </div>
+
+  <div class="row">
+    <label>Mode
+      <select id="mode">
+        <option value="single">single</option>
+        <option value="fallback">fallback</option>
+        <option value="balanced">balanced</option>
+      </select>
+    </label>
+  </div>
+
+  <div class="row">
+    <label>Max concurrent requests
+      <select id="concurrency">
+        <option value="1">1</option>
+        <option value="2">2</option>
+        <option value="4">4</option>
+        <option value="8">8</option>
+      </select>
+    </label>
+  </div>
+
+  <hr />
+
+  <div class="status">
+    <div><span class="k">State</span><span id="state" class="v">Idle</span></div>
+    <div><span class="k">segments</span><span id="segments" class="v">0</span></div>
+    <div><span class="k">translated</span><span id="translated" class="v">0</span></div>
+    <div><span class="k">failed</span><span id="failed" class="v">0</span></div>
+  </div>
+
+  <script type="module" src="popup.js"></script>
+</body>
+</html>

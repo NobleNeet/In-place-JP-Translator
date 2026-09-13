@@ -1,0 +1,28 @@
+{
+  "manifest_version": 3,
+  "name": "PLaMo 2 In-Page Translator",
+  "version": "0.1.0",
+  "description": "Extract English text from a page and translate it to Japanese using a local PLaMo 2 Translate OpenAI-compatible API.",
+  "permissions": ["storage"],
+  "host_permissions": [
+    "http://192.168.50.28:8080/*",
+    "http://127.0.0.1:8080/*"
+  ],
+  "action": {
+    "default_popup": "popup/popup.html",
+    "default_title": "PLaMo 2 Translator"
+  },
+  "background": {
+    "service_worker": "background/background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["*://*/*"],
+      "run_at": "document_idle",
+      "all_frames": false,
+      "js": ["content/content.js"],
+      "type": "module"
+    }
+  ]
+}
