@@ -25,9 +25,9 @@ plamo-page-translator/
 │   └── background.js        # centralizes all API access (chat/completions)
 ├── content/
 │   ├── content.js           # orchestrator: extract -> segment -> batch -> apply
-│   ├── extractor.js         # DOM extraction (readable blocks only)
-│   ├── segmenter.js         # segmentation, language heuristic, token estimate, priority
-│   └── renderer.js          # applies translation, preserves original text
+│   ├── extractor.js         # collects translatable *text nodes* (never elements)
+│   ├── segmenter.js         # one segment per text node, language heuristic, tokens, priority
+│   └── renderer.js          # writes nodeValue only, registry for restore
 ├── api/
 │   ├── profiles.js          # API profiles (endpoints, model, apiKey)
 │   └── openai-client.js     # OpenAI-compatible client (swap-able later)
@@ -39,11 +39,15 @@ plamo-page-translator/
 ├── shared/
 │   ├── logger.js            # toggleable console logging
 │   ├── constants.js         # message types + tunable defaults
+│   ├── messaging.js         # log-friendly message summaries (no DOM nodes)
 │   └── settings.js          # chrome.storage.local read/write
 ├── popup/
 │   ├── popup.html
 │   ├── popup.js
 │   └── popup.css
+├── test/
+│   ├── logic.test.cjs       # queue/batcher/scheduler/cache/background (no DOM)
+│   └── dom.test.cjs         # extractor/segmenter/renderer against a mini DOM
 └── README.md
 ```
 
@@ -66,22 +70,39 @@ you can load the directory directly in Developer mode.
 
 ## API settings
 
-API profiles live in [`api/profiles.js`](api/profiles.js):
+API profiles live in [`api/profiles.js`](api/profiles.js). `url` is the
+**base URL** of the server (it ends with `/v1`), not the full endpoint URL:
 
 ```javascript
 {
-  name: "evo-x2-plamo2",
-  endpoint: "http://192.168.50.28:8080/v1",
-  apiKey: "",
-  model: "plamo-2-translate",
+  name: 'evo-x2-plamo2',
+  url: 'http://192.168.50.28:8080/v1',   // base URL (trailing slash optional)
+  model: 'plamo-2-translate',
+  apiKey: '',
+  systemPrompt: '',
+  endpoint: 'chat/completions'           // appended to url -> POST .../v1/chat/completions
 }
 ```
 
+- `profiles.resolveEndpointUrl(profile)` builds the URL that is POSTed:
+  `"<url>/<endpoint>"` → `http://192.168.50.28:8080/v1/chat/completions`. A
+  `url` that already ends with an endpoint path is used as-is, and a profile
+  without `endpoint` defaults to `chat/completions`.
+- Set `endpoint: 'completions'` to use the plain `/v1/completions` endpoint
+  instead: the request body switches from `messages` to `prompt` and the
+  response is read from `choices[0].text` instead of
+  `choices[0].message.content`.
+- `max_tokens` / `stop` are only sent when a profile (or the caller) sets
+  `maxTokens` / `stop`; `temperature` defaults to `0` (greedy decoding).
 - `apiKey` is currently empty. When it is `""`, **no `Authorization` header is
   sent at all** (see `api/openai-client.js`).
 - `systemPrompt` is empty on purpose: PLaMo 2 Translate is a translation model,
-  so the raw English text is sent as the only message. The mechanism to set a
-  system prompt exists for future models.
+  so the raw English text is sent as the only message. Setting a system prompt
+  adds a `system` message before it for models that need one.
+
+Every request is logged as
+`request <profile> POST <resolved url> model=... kind=... chars=...`, so a wrong
+URL is visible immediately in the console.
 
 Settings you change in the popup (profile, mode, concurrency) are persisted in
 `chrome.storage.local`.
@@ -90,12 +111,21 @@ Settings you change in the popup (profile, mode, concurrency) are persisted in
 
 ## Prerequisites: PLaMo 2 Translate server
 
-- A running PLaMo 2 Translate server exposing an **OpenAI-compatible
-  `/v1/chat/completions`** endpoint.
-- The endpoint URL must be added to `host_permissions` in `manifest.json`
-  (already done for `192.168.50.28:8080` and `127.0.0.1:8080`).
+- A running PLaMo 2 Translate server exposing an **OpenAI-compatible API under a
+  `/v1` base URL** (`/v1/chat/completions` or `/v1/completions`).
+- The server host must be listed in `host_permissions` in `manifest.json`
+  (already done for `192.168.50.28:8080` and `127.0.0.1:8080`). If you point a
+  profile at another host/port, add it there too and reload the extension,
+  otherwise the request is blocked.
 - Because the server runs on your LAN / localhost, make sure the firewall
   allows the connection from the browser.
+- Quick check that a base URL is reachable and shaped as expected:
+
+  ```sh
+  curl -s http://192.168.50.28:8080/v1/chat/completions \
+    -H 'Content-Type: application/json' \
+    -d '{"model":"plamo-2-translate","messages":[{"role":"user","content":"Hello world"}]}'
+  ```
 
 ---
 
@@ -132,10 +162,40 @@ Start / completion summary:
 You can also inspect live state from the console:
 
 ```js
-window.__plamo.getState()   // { phase, segments, translated, failed, ... }
-window.__plamo.getCache()   // SessionCache { map, hits, misses }
-window.__plamo.getSettings()// current settings
+window.__plamo.getState()      // { phase, segments, translated, failed, applied, skipped, skipCounts, ... }
+window.__plamo.getPending()    // what the extractor/segmenter found, before anything is sent
+window.__plamo.getApplied(20)  // one row per text node we rewrote: { path, before, after }
+window.__plamo.scanStats()     // elements walked, skipped subtrees, refused text nodes
+window.__plamo.restoreText(n)  // put one text node back (n from getApplied/getPending)
+window.__plamo.getCache()      // SessionCache { map, hits, misses }
+window.__plamo.getSettings()   // current settings
 ```
+
+---
+
+## Tests
+
+No test framework and no dependencies; both suites run on plain Node:
+
+```
+node test/logic.test.cjs   # queue, batcher, scheduler, cache, background, messaging
+node test/dom.test.cjs     # extractor + segmenter + renderer on a small fake DOM
+```
+
+`test/dom.test.cjs` builds a page containing the structures that used to break
+(nested containers, text around inline links, `<pre>`/`<code>`, form controls,
+`script`/`style`, `aria-hidden`, `translate="no"`, `.notranslate`, hidden
+subtrees, `contenteditable`, SVG) and then checks that translating it
+
+* produces exactly one segment per eligible text node, in document order;
+* leaves every skipped subtree untouched;
+* does not change the DOM **shape** (tags, attributes, number and position of
+  text nodes) — only `Text.nodeValue` changes;
+* can put every value back with `restore()` / `restoreAll()`, without leaving
+  any bookkeeping attribute behind.
+
+Each suite prints one line per assertion and a final `RESULT: n passed, m failed`;
+it exits non-zero when `m` is not 0.
 
 ---
 

@@ -29,8 +29,20 @@
       });
     }
 
+    // Changes the limit in place (used when the popup concurrency setting
+    // changes). Replacing the Semaphore instead would let the old queue and the
+    // new one run past the limit at the same time.
+    function setMax(next) {
+      var prev = maxSlots;
+      if (Number.isFinite(next) && next >= 1) maxSlots = Math.floor(next);
+      if (maxSlots !== prev) pump();
+      return { prev: prev, max: maxSlots, active: active, pending: queue.length };
+    }
+
     return {
       run: run,
+      setMax: setMax,
+      getMax: function () { return maxSlots; },
       getActive: function () { return active; },
       getPending: function () { return queue.length; }
     };

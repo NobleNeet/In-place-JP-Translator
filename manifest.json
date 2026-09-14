@@ -23,6 +23,7 @@
       "js": [
         "shared/logger.js",
         "shared/constants.js",
+        "shared/messaging.js",
         "shared/settings.js",
         "api/profiles.js",
         "api/openai-client.js",

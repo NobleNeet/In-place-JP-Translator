@@ -15,6 +15,7 @@
 
     <div class="actions">
       <button id="translateBtn" class="btn primary">Translate Page</button>
+      <button id="restoreBtn" class="btn">Restore Original</button>
       <button id="stopBtn" class="btn">Stop</button>
     </div>
 
@@ -48,14 +49,24 @@
       <div class="stat"><span class="label">failed</span><span id="failCount" class="value">0</span></div>
     </section>
 
+    <p id="lastError" class="hint"></p>
+
     <details class="debug">
       <summary>Debug (console)</summary>
-      <p class="hint">Open DevTools &rarr; Console and filter by <code>[PLaMoTranslate]</code>.</p>
+      <p class="hint">On the page (F12 &rarr; Console), filter by <code>[PLaMoTranslate]</code> and run:</p>
+      <pre class="hint">__plamo.getState()        // counters of the last run
+__plamo.getApplied()      // text nodes rewritten so far (original &rarr; Japanese)
+__plamo.dumpLogs()        // last log records, including trace level
+__plamo.backgroundLogs()  // the worker's own logs, printed here
+__plamo.getPending()      // what would be translated now
+__plamo.pingBackground()  // is the worker alive?</pre>
+      <p class="hint">Worker console: chrome://extensions (or vivaldi://extensions) &rarr; Service Worker &rarr; Console &rarr; <code>__PLAMO__.background.getDiagnostics()</code>.</p>
     </details>
   </div>
 
   <script src="../shared/logger.js"></script>
   <script src="../shared/constants.js"></script>
+  <script src="../shared/messaging.js"></script>
   <script src="../shared/settings.js"></script>
   <script src="../api/profiles.js"></script>
   <script src="popup.js"></script>
