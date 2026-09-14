@@ -90,6 +90,27 @@
       'P', 'PRE', 'SECTION', 'SUMMARY', 'TABLE', 'TBODY', 'TD', 'TFOOT', 'TH',
       'THEAD', 'TR', 'UL'],
 
+    // --- translation priority (see content/priority.js) ----------------------
+    // The order a page is translated in, best first. The reader came for the
+    // article body, so that goes out first; headings give it structure and
+    // follow; navigation/menus/headers/footers/sidebars are page chrome and can
+    // wait; 'other' is whatever the classifier could not place (a page with no
+    // semantic tags, mostly). The viewport band (visible -> near -> rest) still
+    // orders *inside* a class, so the first answer lands on text on screen.
+    PRIORITY_ROLES: ['content', 'heading', 'navigation', 'other'],
+
+    // Text the user cannot see — display:none, visibility:hidden, [hidden] — is
+    // held back instead of being translated up front: the same words often exist
+    // twice on a page (desktop menu + mobile menu + a closed modal), and the
+    // hidden copy is not text anyone is reading. It is translated the moment it
+    // is displayed, which is when it first becomes worth the model's time.
+    PRIORITY_SETTINGS: {
+      deferHidden: true,       // false = translate hidden text at once (old behaviour)
+      revealDebounceMs: 250,   // how long a style/class change settles before a re-check
+      revealIntervalMs: 4000,  // fallback re-check while hidden text is still pending
+      maxHiddenChecks: 6000    // getComputedStyle() calls per scan, then assume visible
+    },
+
     // Extraction unit is a Text node (never an element): see content/extractor.js.
     // minTextLength drops "a", "»", "2" fragments the model would only mangle;
     // maxTextLength keeps one huge <p> from starving a batch of its token budget.

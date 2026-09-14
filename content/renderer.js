@@ -157,6 +157,11 @@
 
   function appliedCount() { return applied.size; }
 
+  // Have we already rewritten this Text node? A caller that can meet the same
+  // node twice (a menu opened, closed and opened again) asks here instead of
+  // paying for the same text twice.
+  function isApplied(node) { return applied.has(node); }
+
   // Sample of what was changed, for __plamo.getApplied(): path + both texts, so
   // a wrong-looking render can be traced to one node without opening DevTools
   // on the page source.
@@ -190,6 +195,7 @@
     restore: restore,
     restoreAll: restoreAll,
     appliedCount: appliedCount,
+    isApplied: isApplied,
     liveCount: liveCount,
     appliedSample: appliedSample,
     normalizeTranslation: normalizeTranslation,

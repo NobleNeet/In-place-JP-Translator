@@ -23,6 +23,13 @@
         retryWithNumbers: C.REQUEST_SETTINGS.retryWithNumbers,
         perSegmentFallback: C.REQUEST_SETTINGS.perSegmentFallback,
         batchSystemPrompt: C.REQUEST_SETTINGS.batchSystemPrompt
+      },
+      // Which text a run sends first, and what it holds back (content/priority.js).
+      priority: {
+        deferHidden: C.PRIORITY_SETTINGS.deferHidden,
+        revealDebounceMs: C.PRIORITY_SETTINGS.revealDebounceMs,
+        revealIntervalMs: C.PRIORITY_SETTINGS.revealIntervalMs,
+        maxHiddenChecks: C.PRIORITY_SETTINGS.maxHiddenChecks
       }
     };
   }
@@ -35,6 +42,15 @@
     return Object.assign({}, base, patch, {
       maxConcurrent: maxConcurrent,
       batch: Object.assign({}, base.batch, (patch.batch || {})),
+      priority: Object.assign({}, base.priority, (patch.priority || {}), {
+        // The numbers are clamped, not trusted: a stored typo must not turn the
+        // "did it appear yet?" watcher into a busy loop or switch it off with a
+        // negative interval (see the reveal watch in content/content.js).
+        deferHidden: booleanWith((patch.priority || {}).deferHidden, base.priority.deferHidden),
+        revealDebounceMs: clampMs((patch.priority || {}).revealDebounceMs, base.priority.revealDebounceMs, 50, 60000),
+        revealIntervalMs: clampMs((patch.priority || {}).revealIntervalMs, base.priority.revealIntervalMs, 500, 600000),
+        maxHiddenChecks: clampMs((patch.priority || {}).maxHiddenChecks, base.priority.maxHiddenChecks, 50, 100000)
+      }),
       request: Object.assign({}, base.request, (patch.request || {}), { strategy: clampStrategy((patch.request || {}).strategy) })
     });
   }
@@ -59,6 +75,26 @@
     return C.REQUEST_SETTINGS.strategy;
   }
 
+  // Millisecond settings: a bad stored value falls back to the default, and a
+  // value below `min` is raised to it (a reveal watcher with a 1ms interval
+  // would only burn the tab's CPU). A `max` is raised as well, because a timer
+  // measured in hours is not a watcher — it would silently stop checking.
+  function clampMs(value, fallback, min, max) {
+    var n = Math.round(Number(value));
+    if (!Number.isFinite(n)) return fallback;
+    if (n < min) return min;
+    if (max != null && n > max) return max;
+    return n;
+  }
+
+  // A stored switch is a switch only if it is present; an absent one keeps the
+  // default (so a settings object saved before the switch existed changes
+  // nothing).
+  function booleanWith(value, fallback) {
+    if (value == null) return !!fallback;
+    return !!value;
+  }
+
   function isModeSupported(mode) { return C.MODES.indexOf(mode) !== -1; }
 
   ns.settings = {
@@ -66,6 +102,8 @@
     saveSettings: saveSettings,
     clampConcurrent: clampConcurrent,
     clampStrategy: clampStrategy,
+    clampMs: clampMs,
+    booleanWith: booleanWith,
     isModeSupported: isModeSupported,
     defaultSettings: defaultSettings
   };

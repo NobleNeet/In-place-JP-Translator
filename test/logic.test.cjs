@@ -17,7 +17,7 @@ const dir = '/mnt/240GB01/chrome_addon/In-place-JP-Translator';
 const order = [
   'shared/logger.js','shared/constants.js','shared/messaging.js','shared/settings.js',
   'api/profiles.js','api/openai-client.js','translation/scheduler.js','translation/cache.js',
-  'translation/batcher.js','translation/queue.js','content/extractor.js',
+  'translation/batcher.js','translation/queue.js','content/extractor.js','content/priority.js',
   'content/segmenter.js','content/renderer.js','background/background.js',
   'content/content.js','popup/popup.js'
 ];
@@ -586,8 +586,10 @@ async function main() {
   console.log('== content diagnostics API ==');
   const api = sandbox.window.__plamo;
   ok('window.__plamo exposed', typeof api === 'object' && api !== null);
-  ['getState', 'getPending', 'getLogs', 'dumpLogs', 'backgroundLogs', 'pingBackground', 'translatePage', 'restoreAll', 'getCache', 'getSettings', 'getBatchPlan', 'getBatcherCaps', 'getChannel', 'getRecoveryCaps']
+  ['getState', 'getPending', 'getLogs', 'dumpLogs', 'backgroundLogs', 'pingBackground', 'translatePage', 'restoreAll', 'getCache', 'getSettings', 'getBatchPlan', 'getBatcherCaps', 'getChannel', 'getRecoveryCaps', 'getSegmentStats', 'getDeferred', 'revealNow', 'forgetDeferred']
     .forEach(fn => ok('__plamo.' + fn + '()', typeof api[fn] === 'function'));
+  ok('getDeferred() says what a run held back and what is still waiting',
+    api.getDeferred().waiting === 0 && Array.isArray(api.getDeferred().sample), api.getDeferred());
   ok('getChannel names the durable channel', api.getChannel().name === ns.constants.PORT_TRANSLATE &&
     api.getChannel().kind === 'none', JSON.stringify(api.getChannel()));
   ok('the recovery chunk size is a constant', api.getRecoveryCaps().maxSegmentsPerRequest === ns.constants.RECOVERY.maxSegmentsPerRequest);
@@ -611,6 +613,76 @@ async function main() {
     setTimeout(() => resolve({ returned, payload }), 30);
   });
   ok('content answers MSG_STATUS asynchronously', statusReply.returned === true && statusReply.payload.phase !== undefined);
+  ok('the state a popup receives says what was held back', typeof statusReply.payload.waitingForDisplay === 'number');
+
+  console.log('\n== send order, and the hidden text a run refuses to send ==');
+  // content/priority.js answers two questions about a text node: which region of
+  // the page it sits in (so the article is sent before the menu) and whether the
+  // user can see it at all (text inside a closed dropdown is not worth a request
+  // now — the reveal watch translates it when it is displayed). The DOM/CSS half
+  // is covered in test/dom.test.cjs; here the rules and their settings are.
+  const prio = ns.priority;
+  const tagEl = (tag, attrs) => ({
+    nodeType: 1, tagName: tag, childNodes: [], parentNode: null,
+    getAttribute(k) { return (attrs || {})[k] || null; }
+  });
+  ok('elementRole() reads a tag, an ARIA landmark or a class name',
+    prio.elementRole(tagEl('NAV')) === 'navigation' &&
+    prio.elementRole(tagEl('DIV', { role: 'main' })) === 'content' &&
+    prio.elementRole(tagEl('DIV', { class: 'main-nav' })) === 'navigation' &&
+    prio.elementRole(tagEl('H2')) === 'heading',
+    [prio.elementRole(tagEl('NAV')), prio.elementRole(tagEl('DIV', { class: 'main-nav' })), prio.elementRole(tagEl('H2'))]);
+  ok('elementRole() says nothing about a plain element', prio.elementRole(tagEl('SPAN')) === '');
+  const navWrap = tagEl('NAV');
+  const insideNav = { nodeType: 1, tagName: 'DIV', childNodes: [], parentNode: navWrap,
+    getAttribute(k) { return k === 'class' ? 'article' : null; } };
+  ok('text inside a menu stays page chrome however it is named',
+    prio.classify(prio.createContext(), insideNav, 'Article').role === 'navigation');
+  ok('a long run of words with no marker at all is body text',
+    prio.classify(prio.createContext(), tagEl('DIV'), 'word '.repeat(60)).role === 'content');
+  ok('a short run with no marker waits behind everything that has one',
+    prio.classify(prio.createContext(), tagEl('DIV'), 'Menu').role === 'other');
+  const pseg = (id, role, hidden, vp) => ({ id, text: id + ' sample text', role,
+    priority: prio.priorityOf(role), hidden: !!hidden, viewport: vp || 0 });
+  const pordered = prio.sortSegments([
+    pseg('chrome', 'navigation', false, 3), pseg('body', 'content', false, 9),
+    pseg('title', 'heading', false, 1), pseg('later', 'content', true, 0),
+    pseg('more', 'content', false, 2)
+  ]).map((s) => s.id).join(',');
+  ok('a run sends body text by position, then a heading, then chrome, hidden text last',
+    pordered === 'more,body,title,chrome,later', pordered);
+  ok('the histogram a run logs counts every region it sent',
+    (() => { const h = prio.histogram([pseg('a', 'content'), pseg('b', 'navigation'), pseg('c', 'other', true)]);
+      return h.content === 1 && h.navigation === 1 && h.other === 1 && h.hidden === 1; })(),
+    prio.histogram([pseg('a', 'content'), pseg('b', 'navigation'), pseg('c', 'other', true)]));
+  const prioDefaults = ns.settings.defaultSettings().priority;
+  ok('the deferral is on by default and its timers are real numbers',
+    prioDefaults.deferHidden === true && prioDefaults.revealDebounceMs > 0 &&
+    prioDefaults.revealIntervalMs > 0 && prioDefaults.maxHiddenChecks > 0, prioDefaults);
+  ok('a timer that is not a number keeps its default, and an absurd one is clamped',
+    ns.settings.clampMs('fast', 250, 50, 60000) === 250 &&
+    ns.settings.clampMs(1, 250, 50, 60000) === 50 &&
+    ns.settings.clampMs(9e9, 250, 50, 60000) === 60000);
+  await chromeFake.storage.local.set({ plamo: { profileName: 'local-plamo2', maxConcurrent: 3,
+    priority: { deferHidden: 0, revealIntervalMs: 'fast', maxHiddenChecks: 99999999 } } });
+  const prioSet = await ns.settings.loadSettings();
+  ok('a saved switch turns the deferral off, and a saved typo cannot break the watcher',
+    prioSet.priority.deferHidden === false && prioSet.priority.revealIntervalMs === 4000 &&
+    prioSet.priority.maxHiddenChecks === 100000, prioSet.priority);
+
+  // What the popup's "Hidden text" select does: it saves the priority object on
+  // its own, so the reveal timings (and the rest of the settings) must survive.
+  const patched = await ns.settings.saveSettings({
+    priority: Object.assign({}, prioSet.priority, { deferHidden: true })
+  });
+  ok('saving the hidden-text switch keeps the other priority settings',
+    patched.priority.deferHidden === true && patched.priority.revealIntervalMs === 4000 &&
+    patched.priority.maxHiddenChecks === 100000, patched.priority);
+  const afterPopup = await ns.settings.loadSettings();
+  ok('and the next run reads that switch back, with the other settings intact',
+    afterPopup.priority.deferHidden === true && afterPopup.priority.revealIntervalMs === 4000 &&
+    afterPopup.profileName === 'local-plamo2' && afterPopup.batch.maxSegmentsPerBatch > 0,
+    [afterPopup.priority, afterPopup.profileName, afterPopup.batch]);
 
   console.log('\nRESULT: ' + pass + ' passed, ' + fail + ' failed');
   process.exit(fail === 0 ? 0 : 1);

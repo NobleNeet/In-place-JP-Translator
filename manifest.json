@@ -27,6 +27,7 @@
         "shared/settings.js",
         "api/profiles.js",
         "api/openai-client.js",
+        "content/priority.js",
         "content/extractor.js",
         "content/segmenter.js",
         "content/renderer.js",

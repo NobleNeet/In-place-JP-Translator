@@ -18,7 +18,9 @@
 //   * restore()/restoreAll() put the original values back and leave no
 //     attributes behind;
 //   * the fragments of one paragraph (text around an inline link) and the items
-//     of one list are packed into the same API request, never split apart.
+//     of one list are packed into the same API request, never split apart;
+//   * a run sends the article first and the menu last (content/priority.js),
+//     and text the user cannot see is not sent until the page displays it.
 //
 // Run: node test/dom.test.cjs
 
@@ -29,7 +31,9 @@ const vm = require('node:vm');
 const path = require('node:path');
 
 const dir = path.join(__dirname, '..');
-const order = ['shared/logger.js', 'shared/constants.js', 'content/extractor.js',
+// priority.js comes before extractor.js: the extractor asks it whether the user
+// can see a text node, and the segmenter asks it what region the node is in.
+const order = ['shared/logger.js', 'shared/constants.js', 'content/priority.js', 'content/extractor.js',
   'content/segmenter.js', 'content/renderer.js', 'translation/batcher.js'];
 
 // --- mini DOM -----------------------------------------------------------------
@@ -200,7 +204,7 @@ documentMock.appendChild(E('html', {}, E('body', {}, page)));
 // --- load the modules the way the content script does -------------------------
 const warnings = [];
 const sandbox = {
-  console: { log() {}, warn() { warnings.push(Array.prototype.join.call(arguments, ' ')); }, error() { warnings.push(Array.prototype.join.call(arguments, ' ')); }, debug() {}, trace() {} },
+  console: { log() {}, info() {}, warn() { warnings.push(Array.prototype.join.call(arguments, ' ')); }, error() { warnings.push(Array.prototype.join.call(arguments, ' ')); }, debug() {}, trace() {} },
   Map, Set, WeakMap, Promise, Object, Array, String, Number, Boolean, Math, JSON, Date, RegExp,
   Error, TypeError, Symbol, parseInt, parseFloat, isNaN, setTimeout, clearTimeout,
   performance: { now: () => Date.now() },
@@ -262,7 +266,12 @@ function textNodesOf(root, filterFn) {
 }
 const jp = (v) => /[\u3040-\u30ff]/.test(String(v)); // contains kana => translated
 console.log('== extractor: collects text nodes, once each ==');
-const nodes = extractor.extractTextNodes(documentMock);
+// The extractor splits the page into what the user could see and what they
+// could not: hidden text is no longer thrown away, it waits (see the reveal
+// section further down for the waiting part).
+const split = extractor.extractTextNodesSplit(documentMock);
+const nodes = split.visible;
+const hiddenNodes = split.hidden;
 const collected = new Set(nodes);
 const findNode = (value) => textNodesOf(documentMock, (v) => v === value)[0] || null;
 const isCollected = (n) => !!n && collected.has(n);
@@ -274,7 +283,9 @@ function insideSkippedSubtree(n) {
   return false;
 }
 const eligible = textNodesOf(documentMock).filter((n) => !insideSkippedSubtree(n) && extractor.isTranslatableText(n));
-ok('collected exactly the eligible text nodes', nodes.length === eligible.length, [nodes.length, eligible.length]);
+ok('collected exactly the eligible text nodes (visible + hidden)', nodes.length + hiddenNodes.length === eligible.length,
+  [nodes.length, hiddenNodes.length, eligible.length]);
+ok('every held-back node was eligible too', hiddenNodes.every((n) => eligible.indexOf(n) !== -1));
 const scan = extractor.scanStats();
 ok('scan stats: elements walked', scan.elements > 10, scan.elements);
 ok('scan stats: skipped subtrees counted', scan.skippedSubtrees >= 8, scan.skippedSubtrees);
@@ -295,7 +306,10 @@ ok('<style> left alone', !isCollected(findNode('.nav { color: red; }')));
 ok('aria-hidden subtree left alone', !isCollected(findNode('Decorative glyph')));
 ok('translate="no" left alone', !isCollected(findNode('Legal Code')));
 ok('.notranslate left alone', !isCollected(findNode('Do Not Translate')));
-ok('display:none subtree left alone', !isCollected(findNode('Hidden text body')));
+const hiddenBodyNode = findNode('Hidden text body');
+ok('display:none text is not sent up front', !isCollected(hiddenBodyNode));
+ok('display:none text is held back instead of dropped', hiddenNodes.indexOf(hiddenBodyNode) !== -1);
+ok('hidden text is not translated while it is hidden', findNode('Hidden text body') === hiddenBodyNode);
 ok('contenteditable left alone', !isCollected(findNode('Editable area text')));
 ok('<svg> left alone', !isCollected(findNode('SVG label')));
 ok('one-letter fragment dropped', !isCollected(findNode('a')));
@@ -360,13 +374,64 @@ h1El._rect = { top: 5000, bottom: 5040, left: 0, right: 600 }; // far below the 
 const segs2 = segmenter.buildSegments(documentMock);
 const h1Seg = segs2.filter((s) => s.text === 'Getting Started')[0];
 ok('below-the-fold node gets a lower viewport band', !!h1Seg && h1Seg.viewport === 3, h1Seg && h1Seg.viewport);
-const ordered = segmenter.sortSegmentsByViewport(segs2);
-ok('viewport-first ordering', ordered[0].viewport === 1 && ordered[ordered.length - 1].viewport === 3,
-  ordered.map((s) => s.viewport).slice(0, 3));
-const inView = ordered.filter((s) => s.viewport === 1).map((s) => s.source.node);
-const docOrder = textNodesOf(documentMock).filter((n) => inView.indexOf(n) !== -1);
-ok('document order kept inside a band', inView.map((n) => n.nodeValue).join('|') === docOrder.map((n) => n.nodeValue).join('|'),
-  [inView.map((n) => n.nodeValue), docOrder.map((n) => n.nodeValue)]);
+
+// The order a run sends segments in. The <nav> sits at the top of the document,
+// but it is page chrome: the article goes first, then its headings, then the
+// chrome — and inside one class whatever is on screen before the rest.
+const PR = ns.constants.PRIORITY_ROLES;
+const ordered = segmenter.sortSegments(segs2);
+const at = (text) => ordered.map((s) => s.text).indexOf(text);
+ok('every segment carries its region and that region number',
+  segs2.every((s) => s.priority === PR.indexOf(s.role)), segs2.map((s) => [s.role, s.priority]));
+ok('article text is sent before the menu', at('Welcome to the product.') < at('Home'),
+  [at('Welcome to the product.'), at('Home')]);
+ok('a heading follows the body it heads', at('Welcome to the product.') < at('Getting Started'),
+  [at('Welcome to the product.'), at('Getting Started')]);
+ok('page chrome is last even though it comes first in the document',
+  at('Home') > at('Getting Started') && at('Docs') > at('Getting Started'),
+  [at('Home'), at('Docs'), at('Getting Started')]);
+const priorities = ordered.map((s) => s.priority);
+ok('the queue never goes back to a class it already passed',
+  priorities.every((p, i) => i === 0 || priorities[i - 1] <= p), priorities);
+const contentBands = ordered.filter((s) => s.role === 'content').map((s) => s.viewport);
+ok('inside one class the viewport band still decides',
+  contentBands.every((b, i) => i === 0 || contentBands[i - 1] <= b), contentBands);
+const docIndexOf = (s) => textNodesOf(documentMock).indexOf(s.source.node);
+const keptDocOrder = (() => {
+  const last = new Map();
+  for (const s of ordered) {
+    const key = s.priority + ':' + s.viewport;
+    const prev = last.get(key);
+    if (prev !== undefined && docIndexOf(prev) > docIndexOf(s)) return false;
+    last.set(key, s);
+  }
+  return true;
+})();
+ok('document order kept inside one class and band', keptDocOrder);
+console.log('== priority: what region a text node sits in, and what waits ==');
+const roleOfText = (text) => (segs2.filter((s) => s.text === text)[0] || {}).role;
+ok('running-on text inside <main> is the article', roleOfText('Welcome to the product.') === 'content', roleOfText('Welcome to the product.'));
+ok('a heading inside the article is still a heading', roleOfText('Getting Started') === 'heading', roleOfText('Getting Started'));
+ok('a link inside <nav> is page chrome', roleOfText('Home') === 'navigation', roleOfText('Home'));
+ok('nothing was left without a region', segs2.every((s) => !!s.role), segs2.map((s) => s.source.path));
+const held = segmenter.buildSegmentsResult(documentMock);
+const sentNow = segmenter.buildSegmentsResult(documentMock, { deferHidden: false });
+ok('text the user could not see becomes no segment',
+  !held.segments.some((s) => s.text === 'Hidden text body') && held.deferred.length === 1,
+  [held.segments.length, held.deferred.length]);
+ok('turning the deferral off sends the same text, marked hidden',
+  sentNow.segments.some((s) => s.text === 'Hidden text body' && s.hidden === true) && sentNow.deferred.length === 0,
+  [sentNow.segments.length, sentNow.deferred.length]);
+ok('deferring is one segment fewer in the run', held.segments.length === sentNow.segments.length - 1);
+ok('held-back text is last in the queue when it is sent at all',
+  segmenter.sortSegments(sentNow.segments).slice(-1)[0].text === 'Hidden text body');
+const st = held.stats;
+ok('the run says what it held back', st.deferred === 1 && st.hiddenNodes === 1 && st.deferHidden === true, st);
+ok('the role histogram covers every class in constants',
+  PR.every((r) => st.roles[r] >= 0), st.roles);
+const plan = ns.segmenter.sortSegments(held.segments);
+ok('a run that holds text back still covers the whole visible page',
+  plan.length === segs.filter((s) => s.text !== 'Hidden text body').length, [plan.length, segs.length]);
 console.log('== renderer: writing a translation changes ONLY Text.nodeValue ==');
 const shapeBefore = shape(documentMock);
 const valuesBefore = values(documentMock);
@@ -471,5 +536,231 @@ ok('restoreAll() again has nothing to do', renderer.restoreAll() === 0);
 ok('extractor still finds the same text nodes after a full cycle',
   extractor.extractTextNodes(documentMock).length === nodes.length);
 
-console.log('\nRESULT: ' + pass + ' passed, ' + fail + ' failed');
-process.exit(fail === 0 ? 0 : 1);
+console.log('== reveal: text the user could not see, and then could ==');
+// The held-back list is only worth keeping if the text comes back: a closed
+// dropdown is translated when the reader opens it. This is the page-side half of
+// that (content/content.js watches for the style/class change and re-asks).
+const closedMenu = documentMock.querySelectorAll('div').filter((d) =>
+  /display:none/.test(d.getAttribute('style') || ''))[0];
+const closedNode = findNode('Hidden text body');
+const vis = ns.priority.createVisibility(documentMock);
+ok('priority: the closed subtree is hidden', vis.hidden(closedMenu) === true);
+ok('priority: so is the text inside it', vis.hidden(closedNode.parentNode) === true);
+const beforeOpen = extractor.extractTextNodesSplit(documentMock);
+ok('the closed text is in the held-back list, not in the run',
+  beforeOpen.hidden.indexOf(closedNode) !== -1 && beforeOpen.visible.indexOf(closedNode) === -1,
+  [beforeOpen.visible.length, beforeOpen.hidden.length]);
+closedMenu.setAttribute('style', 'display:block'); // the reader opened the menu
+const afterOpen = extractor.extractTextNodesSplit(documentMock);
+ok('once it is displayed it is collected as visible',
+  afterOpen.visible.indexOf(closedNode) !== -1 && afterOpen.hidden.indexOf(closedNode) === -1);
+const revealed = segmenter.buildSegments(documentMock).filter((s) => s.source.node === closedNode)[0];
+ok('the revealed text is an ordinary segment now', !!revealed && revealed.hidden === false &&
+  revealed.source.original === 'Hidden text body', revealed && [revealed.hidden, revealed.source.original]);
+ok('and it knows what region it sits in', !!revealed && !!revealed.role, revealed && revealed.role);
+const revealedWrite = renderer.applySegment(revealed, 'ヒミツノナオン');
+ok('it is written into the same text node it was held back from',
+  revealedWrite.ok === true && jp(closedNode.nodeValue));
+renderer.restore(closedNode);
+ok('restore puts the hidden original back', closedNode.nodeValue === 'Hidden text body');
+const poorVis = ns.priority.createVisibility(documentMock, { maxHiddenChecks: 0 });
+ok('past the CSS budget the answer is visible and it says so',
+  poorVis.hidden(documentMock.querySelectorAll('main')[0]) === false && poorVis.stats().budgetHit === true, poorVis.stats());
+const orphan = mkScratch('Orphan text here');
+ok('a node the page threw away is not waited on for ever',
+  ns.priority.createVisibility(documentMock).attached(orphan) === false);
+
+// --- the orchestrator on top of the same page -----------------------------------
+// Everything above asked a single module. This last section loads the orchestrator
+// (content/content.js) over the same mini page with a fake extension that answers
+// translation requests, and drives the one thing only the orchestrator owns: hold
+// text back while the user cannot see it, and translate it when the page shows it.
+console.log('== reveal watch: hidden text waits and is translated when displayed ==');
+
+const stored = {};
+const bg = { requests: 0, sent: [] }; // the fake worker: what it was asked to translate
+function answerTranslate(msg, respond) {
+  const wire = (msg && msg.batch && msg.batch.segments) || [];
+  const results = {};
+  wire.forEach((s) => {
+    bg.requests++;
+    bg.sent.push(s.text);
+    // A translation with no Latin letters in it, so the page's own "is this
+    // English?" rule refuses to collect it a second time.
+    results[s.id] = { text: s.text, translatedText: 'ヒミツノモジ' };
+  });
+  setTimeout(() => respond({
+    requestId: msg.id, status: 'success', results, translated: wire.length, failed: 0,
+    cacheHits: 0, requests: 1, segments: wire.length, units: (msg.batch && msg.batch.units) || 1,
+    elapsedMs: 1, profile: 'fake', endpoint: 'http://127.0.0.1:9/v1', strategy: 'multi'
+  }), 0);
+}
+sandbox.chrome = {
+  runtime: {
+    id: 'test-extension', lastError: null,
+    getManifest: () => ({ version: '0.1.0' }),
+    // No connect() on purpose: the page then uses sendMessage per request, which
+    // is the one path this fake can answer without a port pair.
+    onMessage: { listeners: [], addListener(fn) { this.listeners.push(fn); } },
+    sendMessage(msg, cb) {
+      if (msg && msg.type === ns.constants.MSG_TRANSLATE) return answerTranslate(msg, cb || (() => {}));
+      if (typeof cb === 'function') setTimeout(() => cb({ ok: true }), 0); // status pings
+    }
+  },
+  storage: { local: { get: async () => Object.assign({}, stored), set: async (o) => Object.assign(stored, o) } }
+};
+sandbox.setInterval = setInterval; // the watcher's fallback poll (no MutationObserver here)
+// The orchestrator's own log lines, kept so a failing expectation below can be
+// read out with DOM_DEBUG=1 instead of being guessed at.
+const infos = [];
+sandbox.console.info = function () { infos.push(Array.prototype.join.call(arguments, ' ')); };
+sandbox.console.warn = function () { infos.push('WARN ' + Array.prototype.join.call(arguments, ' ')); };
+const debugLogs = (from) => {
+  if (process.env.DOM_DEBUG) console.log(infos.slice(from || -30).join('\n'));
+};
+// The mini DOM above needed no real timers; the orchestrator does — it waits for
+// the fake worker's answers through setTimeout, and stops its watcher through
+// clearInterval/clearTimeout. All four must be the host's, not stubs.
+sandbox.setTimeout = setTimeout;
+sandbox.clearTimeout = clearTimeout;
+sandbox.clearInterval = clearInterval;
+const contentOrder = ['shared/messaging.js', 'shared/settings.js', 'api/profiles.js',
+  'api/openai-client.js', 'translation/cache.js', 'content/content.js'];
+for (const f of contentOrder) vm.runInContext(readFileSync(path.join(dir, f), 'utf8'), ctx, { filename: f });
+
+const api = sandbox.window.__plamo;
+const contentListener = sandbox.chrome.runtime.onMessage.listeners[0];
+const send = (msg) => new Promise((resolve) => contentListener(msg, {}, resolve));
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const mainEl = documentMock.querySelectorAll('main')[0];
+// A closed dropdown with two texts in it: exactly what must not cost a request
+// while it is closed. `texts` keeps the Text nodes, because looking them up by
+// value stops working once they are translated.
+function closedBox(tag) {
+  const box = E('div', { class: 'menu ' + tag, style: 'display:none' },
+    E('a', { href: '#' }, 'Secret entry ' + tag), E('p', {}, 'Hidden until opened ' + tag));
+  mainEl.appendChild(box);
+  return { box, texts: box.childNodes.map((c) => c.firstChild) };
+}
+async function waitIdle(limit) {
+  for (let i = 0; i < (limit || 80) && api.getState().phase !== 'idle'; i++) await sleep(10);
+  return api.getState();
+}
+const putSettings = (patch) => sandbox.chrome.storage.local.set(patch);
+
+(async function revealWatch() {
+  const first = closedBox('a');
+  const sentBefore = bg.sent.slice();
+  await api.translatePage();
+  await waitIdle();
+  ok('a closed dropdown is left in English while it is closed',
+    first.texts.every((n) => !jp(n.nodeValue) && /Secret entry|Hidden until/.test(n.nodeValue)),
+    first.texts.map((t) => t.nodeValue));
+  ok('and nothing of it went out in a request',
+    !bg.sent.slice(sentBefore.length).some((t) => /Secret entry|Hidden until/.test(t)),
+    bg.sent.slice(sentBefore.length).filter((t) => /Secret|Hidden/.test(t)));
+  const st1 = api.getState();
+  debugLogs();
+  if (process.env.DOM_DEBUG) console.log('DBG applied=' + st1.applied + ' registry=' + renderer.appliedCount() +
+    ' jpMain=' + jp(mainEl.textContent) + ' bgRequests=' + bg.requests);
+  ok('the run says what it held back (both texts of the closed box)',
+    st1.deferred === 2 && st1.waitingForDisplay === 2,
+    [st1.deferred, st1.waitingForDisplay]);
+  ok('the visible text of the page did go out, and getState() reports it',
+    st1.applied > 0 && st1.applied === st1.renderedNodes && jp(mainEl.textContent),
+    [st1.applied, st1.renderedNodes]);
+  const held = api.getDeferred();
+  ok('the waiting list names the text and says it is watching',
+    held.waiting === 2 && held.watching === true && held.sample.length === 2 &&
+    /Secret entry a/.test(held.sample.map((s) => s.text).join('|')), held);
+  ok('the last scan reports the deferral too',
+    api.getSegmentStats().deferred === 2 && api.getSegmentStats().deferHidden === true, api.getSegmentStats());
+
+  // The reader opens the dropdown.
+  first.box.setAttribute('style', 'display:block');
+  const ready = api.revealNow();
+  ok('the check a style change triggers finds the two displayed nodes', ready.length === 2, ready.length);
+  await sleep(20);
+  await waitIdle();
+  ok('and they are translated by a run of their own', first.texts.every((n) => jp(n.nodeValue)),
+    first.texts.map((t) => t.nodeValue));
+  const afterReveal = bg.requests;
+  const statsAfter = api.getDeferred();
+  ok('nothing is waiting any more', statsAfter.waiting === 0 && statsAfter.stats.revealed >= 2, statsAfter);
+  ok('revealing the same menu again costs nothing',
+    api.revealNow().length === 0 && bg.requests === afterReveal, [api.revealNow().length, bg.requests]);
+  // Stop means "no more requests": the watcher must not start a run of its own.
+  const second = closedBox('b');
+  await api.translatePage();
+  await waitIdle();
+  ok('the next run holds the new closed text back', api.getState().waitingForDisplay === 2,
+    api.getState().waitingForDisplay);
+  const stopped = await send({ type: ns.constants.MSG_STOP, id: 'stop-reveal' });
+  ok('Stop keeps the waiting list but stops the watching',
+    stopped.waitingForDisplay === 2 && api.getDeferred().watching === false,
+    [stopped.waitingForDisplay, api.getDeferred().watching]);
+  second.box.setAttribute('style', 'display:block');
+  const requestsWhileStopped = bg.requests;
+  const readyWhileStopped = api.revealNow();
+  await sleep(20);
+  ok('while Stop is in effect a displayed node is not translated',
+    readyWhileStopped.length === 2 && bg.requests === requestsWhileStopped &&
+    second.texts.every((n) => !jp(n.nodeValue)),
+    [readyWhileStopped.length, bg.requests - requestsWhileStopped]);
+  ok('and it goes back on the waiting list instead of being lost',
+    api.getState().waitingForDisplay === 2, api.getState().waitingForDisplay);
+  const sentBeforeNext = bg.sent.length;
+  await api.translatePage(); // a fresh run clears the Stop
+  await waitIdle();
+  ok('the next run picks the waiting text up', second.texts.every((n) => jp(n.nodeValue)) &&
+    bg.sent.slice(sentBeforeNext).filter((t) => /Secret entry b/.test(t)).length === 1,
+    bg.sent.slice(sentBeforeNext).filter((t) => /Secret|Hidden/.test(t)));
+  ok('a node that run translated is not left waiting to be revealed again',
+    api.getState().waitingForDisplay === 0, api.getDeferred().sample.map((s) => s.text));
+
+  // "Translate hidden text at once" has to mean exactly that.
+  await putSettings({ plamo: { priority: { deferHidden: false } } });
+  const third = closedBox('c');
+  await api.translatePage();
+  await waitIdle();
+  ok('with deferHidden off the hidden text is translated in the same run',
+    third.texts.every((n) => jp(n.nodeValue)) && api.getState().deferred === 0,
+    [api.getState().deferred, third.texts.map((t) => t.nodeValue)]);
+  ok('hidden text that run translated is not queued for a reveal',
+    api.getState().waitingForDisplay === 0, api.getDeferred().sample.map((s) => s.text));
+  await putSettings({ plamo: { priority: { deferHidden: true } } });
+
+  const fourth = closedBox('d');
+  await api.translatePage();
+  await waitIdle();
+  ok('a closed box is waited for again', api.getDeferred().waiting === 2, api.getDeferred());
+  ok('forgetDeferred drops the waiting list', api.forgetDeferred() === 2 &&
+    api.getDeferred().waiting === 0 && api.getDeferred().watching === false, api.getDeferred());
+  const fifth = closedBox('e');
+  await api.translatePage();
+  await waitIdle();
+  // forgetDeferred only drops the list; the closed text is still on the page, so
+  // the next run holds both of the still-closed boxes back again.
+  ok('a new run waits for every text still closed', api.getState().waitingForDisplay === 4,
+    api.getDeferred().sample.map((s) => s.text));
+  ok('the text that is being waited for was left in English',
+    fifth.texts.every((n) => !jp(n.nodeValue)), fifth.texts.map((t) => t.nodeValue));
+  api.restoreAll();
+  ok('and restoreAll() clears what was being waited for',
+    api.getState().waitingForDisplay === 0 && fifth.texts.every((n) => !jp(n.nodeValue)) &&
+    renderer.appliedCount() === 0 && !jp(first.texts[0].nodeValue),
+    [api.getState().waitingForDisplay, renderer.appliedCount(), first.texts[0].nodeValue]);
+  await sleep(30); // give the fallback poll a chance to show any stray request
+  ok('the watcher is quiet once nothing is waiting', api.getDeferred().watching === false, api.getDeferred());
+
+})().then(finish, function (err) {
+  fail++;
+  console.log('  FAIL reveal watch section threw: ' + ((err && err.stack) || err));
+  finish();
+});
+
+function finish() {
+  console.log('\nRESULT: ' + pass + ' passed, ' + fail + ' failed');
+  process.exit(fail === 0 ? 0 : 1);
+}
+

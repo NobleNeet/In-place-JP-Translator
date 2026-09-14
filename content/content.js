@@ -1,10 +1,11 @@
 // content/content.js
 // Classic-script orchestrator. Runs in the page's content-script scope.
 // Loads in order: logger, constants, settings, profiles, openai-client,
-// extractor, segmenter, renderer, batcher, cache, queue.
+// priority, extractor, segmenter, renderer, batcher, cache, queue.
 //
-// Flow: collect TEXT NODES -> one segment per text node -> order by viewport
-// priority -> pack the segments into batches, where one batch is ONE API
+// Flow: collect TEXT NODES -> one segment per text node -> order by region
+// (article body, then headings, then page chrome) and inside a region by
+// viewport band -> pack the segments into batches, where one batch is ONE API
 // request (paragraph fragments stay together, menu/list items are piled into
 // the same request) -> send each batch to the background (in parallel,
 // concurrency bound = requests in flight) -> write each finished translation
@@ -12,6 +13,9 @@
 // Because an element's children are never replaced, links/forms/images survive
 // and the layout holds. MSG_RESTORE (or __plamo.restoreAll()) puts the original
 // values back.
+// Text the user could not see when the page was scanned is not sent at all: it
+// is remembered and translated on its own as soon as the page displays it (see
+// the reveal watch below, and content/priority.js for what counts as hidden).
 (function () {
   var ns = globalThis.__PLAMO__;
 
@@ -25,10 +29,13 @@
   var MSG_TRANSLATE = C.MSG_TRANSLATE;
   var MSG_DIAGNOSTICS = C.MSG_DIAGNOSTICS;
 
-  // buildSegments() walks the tree for translatable Text nodes (document
-  // order) and attaches each one to its segment through segment.source.node.
-  var buildSegments = ns.segmenter.buildSegments;
-  var sortSegmentsByViewport = ns.segmenter.sortSegmentsByViewport;
+  // buildSegmentsResult() walks the tree for translatable Text nodes (document
+  // order) and answers two questions at once: the segments a run should send —
+  // each holding its own Text node in segment.source.node — and the hidden text
+  // nodes it held back instead of sending. sortSegments() is the send order:
+  // article body, then headings, then page chrome, viewport band inside each.
+  var buildSegmentsResult = ns.segmenter.buildSegmentsResult;
+  var sortSegments = ns.segmenter.sortSegments;
   // applySegment writes into a Text node (node.nodeValue only); the renderer
   // keeps the registry that makes restoreAll possible.
   var renderer = ns.renderer;
@@ -57,6 +64,30 @@
     return batcher;
   }
   applyBatchSettings();
+
+  // The region/deferral knobs for one scan: defaults from shared/constants.js
+  // (PRIORITY_SETTINGS) with the saved settings.priority on top. Read per scan,
+  // so a popup change applies to the next run without reloading the page.
+  function prioritySettings() {
+    var P = C.PRIORITY_SETTINGS || {};
+    var p = (settings && settings.priority) || {};
+    return {
+      deferHidden: p.deferHidden != null ? !!p.deferHidden : P.deferHidden !== false,
+      revealDebounceMs: Number(p.revealDebounceMs) || P.revealDebounceMs || 250,
+      revealIntervalMs: Number(p.revealIntervalMs) || P.revealIntervalMs || 4000,
+      maxHiddenChecks: Number(p.maxHiddenChecks) || P.maxHiddenChecks || 6000
+    };
+  }
+
+  // What one scan produces: the segments to send (in send order after
+  // sortSegments) and the hidden Text nodes held back. opts.nodes limits the
+  // scan to those nodes, which is how a revealed menu costs one small request
+  // instead of a re-read of the whole page.
+  function collectSegments(root, opts) {
+    var o = prioritySettings();
+    if (opts && opts.nodes) o.nodes = opts.nodes;
+    return buildSegmentsResult(root, o);
+  }
   var cache = new SessionCache();
   var abortRequested = false;
   var runSeq = 0;
@@ -217,6 +248,22 @@
     return { translated: 0, failed: 0, cacheHits: 0, applied: 0, skipped: 0, requests: 0, errorCounts: {}, skipCounts: {}, errors: [] };
   }
 
+  // __plamo.getState() reports the counters of the run it is asked about, so they
+  // are copied from the run's own stats at the places where those change -
+  // otherwise a finished run reads back as "applied: 0" while the page is full of
+  // translations, which is exactly the kind of thing that sends a user to the
+  // console looking for a bug that is not there.
+  function syncLive(stats) {
+    if (!live || !stats) return;
+    live.translated = stats.translated;
+    live.failed = stats.failed;
+    live.cacheHits = stats.cacheHits;
+    live.applied = stats.applied;
+    live.skipped = stats.skipped;
+    live.errorCounts = stats.errorCounts;
+    live.skipCounts = stats.skipCounts;
+  }
+
   function countError(stats, kind) {
     stats.errorCounts[kind] = (stats.errorCounts[kind] || 0) + 1;
     if (live) live.errorCounts = stats.errorCounts;
@@ -308,6 +355,7 @@
     stats.requests += (typeof res.requests === 'number') ? res.requests : 0;
     if (live) live.requests = stats.requests;
     applyBatchResults(btag, res, segmentsById, stats);
+    syncLive(stats); // the counters getState() reports
 
     if (translatedCount && !latencies.firstTranslatedLatencyMs) {
       latencies.firstTranslatedLatencyMs = Math.round(performance.now() - latencies.t0);
@@ -382,6 +430,7 @@
           stats.failed += chunkBatch.segments.length;
           countError(stats, 'transport');
           pushError(stats, lastErrorMessage(err));
+          syncLive(stats);
           log.error(retryTag + ' FAILED too, ' + chunkBatch.segments.length + ' segment(s) stay untranslated: ' +
             lastErrorMessage(err) + hintFor(lastErrorMessage(err)) + ' :: ' + messaging.summarizeBatch(chunkBatch));
         });
@@ -395,11 +444,13 @@
     });
   }
 
-  function translatePage(root) {
+  // root: the subtree to scan. opts.nodes: scan ONLY these Text nodes — the way
+  // a revealed menu costs one small request instead of a fresh read of the page.
+  function translatePage(root, opts) {
     abortRequested = false;
     setStatus('translating');
     var runId = ++runSeq;
-    var tag = 'run#' + runId;
+    var tag = 'run#' + runId + (opts && opts.nodes ? ' reveal(' + opts.nodes.length + ' node(s))' : '');
     live = {
       runId: runId, phase: 'loading-settings', segments: 0, batches: 0, sent: 0, inFlight: 0,
       units: 0, requests: 0,
@@ -412,20 +463,34 @@
       // The saved caps have to reach the packer, which was built before settings
       // were loaded (see applyBatchSettings).
       applyBatchSettings();
-      var segments = buildSegments(root || document);
+      // What this run sends, and what the scan held back because the user could
+      // not see it. The held-back nodes are not wasted: the reveal watch below
+      // translates them as soon as the page displays them.
+      var built = collectSegments(root || document, opts);
+      var segments = built.segments;
       live.segments = segments.length;
+      live.deferred = built.stats.deferred;
+      live.roles = built.roles || null;
+      // What this scan held back goes on the waiting list; what it sent does not.
+      var sentNodes = new Set();
+      segments.forEach(function (seg) { if (seg && seg.source && seg.source.node) sentNodes.add(seg.source.node); });
+      keepDeferred(built.deferred, sentNodes);
       log.info(tag + ' extracted segments=' + segments.length + ' viewport=' + JSON.stringify(countViewport(segments)) +
+        ' roles=' + JSON.stringify(built.roles || {}) + ' deferred=' + built.stats.deferred +
+        ' deferHidden=' + built.stats.deferHidden +
         ' profile=' + settings.profileName + ' maxConcurrent=' + settings.maxConcurrent +
         ' cache=' + cache.map.size + ' cacheHits=' + cache.hits);
       if (!segments.length) {
         setStatus('idle');
         live.phase = 'idle';
         lastRun = emptySummary();
-        log.warn(tag + ' nothing to translate (0 segments). If this page is English and untouched, check __plamo.getPending().');
+        log.warn(tag + ' nothing to translate (0 segments' + (built.stats.deferred ?
+          ', but ' + built.stats.deferred + ' hidden text node(s) are held back and will be translated when displayed' : '') +
+          '). If this page is English and untouched, check __plamo.getPending().');
         return lastRun;
       }
 
-      segments = sortSegmentsByViewport(segments);
+      segments = sortSegments(segments);
       var segmentsById = {};
       segments.forEach(function (s) { segmentsById[s.id] = s; });
       // One batch = one API request: the units are the blocks the segments came
@@ -566,8 +631,14 @@
     if (request.type === MSG_STOP) {
       abortRequested = true;
       setStatus('idle');
-      log.warn('stop requested (run#' + (live ? live.runId : '-') + '); in-flight batches are not cancelled, their results are still applied');
-      return Promise.resolve({ ok: true, aborted: true, state: getState() });
+      // A reveal of its own starts a NEW run, so a Stop that only paused the
+      // batches in flight would still end up sending requests minutes later.
+      // The waiting list is kept: the next run holds those nodes back again and
+      // resumes watching them (see keepDeferred).
+      stopRevealWatch('stop requested');
+      log.warn('stop requested (run#' + (live ? live.runId : '-') + '); in-flight batches are not cancelled, their results are still applied' +
+        (deferredNodes.length ? '; ' + deferredNodes.length + ' hidden text node(s) stay untranslated and unwatched until the next run' : ''));
+      return Promise.resolve({ ok: true, aborted: true, waitingForDisplay: deferredNodes.length, state: getState() });
     }
     if (request.type === MSG_STATUS) {
       return Promise.resolve(getState());
@@ -625,6 +696,12 @@
       errorCounts: l.errorCounts || {},
       skipCounts: l.skipCounts || {},
       renderedNodes: renderer.appliedCount(),
+      // Region counts of the current/last run and the hidden text it held back;
+      // waitingForDisplay is what the reveal watch is still waiting for.
+      roles: l.roles || null,
+      deferred: l.deferred || 0,
+      waitingForDisplay: deferredNodes.length,
+      reveal: Object.assign({}, revealStats),
       // How the last/current run talks to the worker: 'port' is the durable
       // channel, 'sendMessage' means connect() was unavailable to this page.
       channel: l.channel || (channel ? 'port' : 'sendMessage'),
@@ -640,10 +717,17 @@
   // way to separate "no English text found" from "the request failed".
   function getPending(opts) {
     var root = (opts && opts.root) || document;
-    var segments = buildSegments(root);
+    var built = collectSegments(root, null);
+    var segments = built.segments;
     return {
       count: segments.length,
       viewport: countViewport(segments),
+      // Which region each segment belongs to, and what this scan would hold
+      // back because the user cannot see it (see __plamo.getDeferred()).
+      roles: built.roles || null,
+      deferredHidden: built.stats.deferred,
+      deferHidden: built.stats.deferHidden,
+      waitingForDisplay: deferredNodes.length,
       // Text nodes we have already rewritten (see __plamo.getApplied()).
       alreadyTranslated: renderer.appliedCount(),
       cacheEntries: cache.map.size,
@@ -652,7 +736,8 @@
       scan: ns.extractor.scanStats(),
       sample: segments.slice(0, 10).map(function (s) {
         return {
-          id: s.id, viewport: s.viewport, chars: s.text.length,
+          id: s.id, viewport: s.viewport, role: s.role, priority: s.priority,
+          hidden: s.hidden, chars: s.text.length,
           hasNode: !!(s.source && s.source.node), path: (s.source && s.source.path) || '',
           parentTag: (s.source && s.source.parentTag) || '',
           cached: cache.map.has(s.text),
@@ -669,7 +754,8 @@
   function getBatchPlan(opts) {
     var root = (opts && opts.root) || document;
     applyBatchSettings();
-    var segments = sortSegmentsByViewport(buildSegments(root));
+    var built = collectSegments(root, null);
+    var segments = sortSegments(built.segments);
     var unitList = batcher.units(segments);
     var batches = batcher.batchUnits(segments);
     return {
@@ -680,11 +766,18 @@
       caps: batcherCaps, // what the packer in use was built with
       strategy: (settings && settings.request && settings.request.strategy) || C.REQUEST_SETTINGS.strategy,
       viewport: countViewport(segments),
+      // The order the packer sees: article body first, then headings, then page
+      // chrome. `deferredHidden` is text a run would not send at all, because
+      // the user cannot see it (see __plamo.getDeferred()).
+      roles: built.roles || null,
+      deferredHidden: built.stats.deferred,
+      deferHidden: built.stats.deferHidden,
       batches: batches.slice(0, (opts && opts.limit) || 8).map(function (b, i) {
         return {
           index: i + 1, segments: b.segments.length, blocks: b.units,
           estimatedTokens: b.estimatedTokens,
-          sample: b.segments.slice(0, 3).map(function (s) { return s.text.slice(0, 40); })
+          roles: ns.priority ? ns.priority.histogram(b.segments) : null,
+          sample: b.segments.slice(0, 3).map(function (s) { return (s.role || '?') + ':' + s.text.slice(0, 32); })
         };
       })
     };
@@ -721,9 +814,231 @@
   // it. The originals live in the renderer's registry, not in data-* attributes,
   // so the page ends up exactly as it was loaded (no leftover attributes).
   function restoreAll(root) {
+    forgetDeferred('restoreAll: nothing is being waited for');
     var restored = restoreNodes(root);
     log.info('restored ' + restored + ' text node(s) to the original text');
     return restored;
+  }
+
+  // --- hidden text, and the watch for the page showing it ---------------------
+  // A scan hands over the Text nodes it did not send because the user could not
+  // see them: a closed dropdown, a modal, the mobile copy of a menu. That text
+  // is worth a request only once somebody can read it, so the nodes are kept
+  // here and re-checked when the page touches their style. Whatever turns out
+  // visible goes through the same pipeline as a normal run — as its own small
+  // run (see translatePage's opts.nodes), never as a re-read of the whole page.
+  var deferredNodes = []; // { node, parent } in document order
+  var deferredSeen = new Set(); // the same Text node is never remembered twice
+  var revealStats = { scans: 0, checks: 0, revealed: 0, detached: 0, alreadyTranslated: 0, lastScanMs: 0, at: null };
+  var revealTimer = null;
+  var revealPoll = null;
+  var revealObserver = null;
+  // The attributes a page toggles when it opens something: an inline style or a
+  // class on the container, or [hidden]/aria-hidden. childList is deliberately
+  // not observed: text the page inserts arrives with the next run anyway.
+  var REVEAL_ATTRS = ['style', 'class', 'hidden', 'aria-hidden', 'inert', 'open'];
+
+  // Remembers what a scan held back, and starts watching while any is left.
+  // The waiting list across runs: add what this scan held back, and drop what
+  // must not be waited for any more - a node this run just sent, and a node that
+  // already carries a translation (a reveal may have handled it between two runs,
+  // and a run that re-collects it as visible would otherwise leave it queued
+  // forever, translating the same text on every run).
+  function keepDeferred(deferred, sentNodes) {
+    var dropped = 0;
+    deferredNodes = deferredNodes.filter(function (entry) {
+      var node = entry.node;
+      if (node && (!sentNodes || !sentNodes.has(node)) && !renderer.isApplied(node)) return true;
+      if (node) deferredSeen.delete(node);
+      dropped++;
+      return false;
+    });
+    if (dropped) {
+      log.trace('reveal: ' + dropped + ' waiting node(s) dropped (sent by this run or already translated)');
+    }
+    var fresh = 0;
+    (deferred || []).forEach(function (node) {
+      if (!node || deferredSeen.has(node)) return;
+      // A node this run is translating, or one that already carries a
+      // translation, is not something to wait for - the extractor hands over
+      // hidden nodes whether or not they have been written to already.
+      if (sentNodes && sentNodes.has(node)) return;
+      if (renderer.isApplied(node)) return;
+      deferredSeen.add(node);
+      deferredNodes.push({ node: node, parent: node.parentNode });
+      fresh++;
+    });
+    if (!fresh) {
+      // Nothing new, but something IS waiting: after a Stop the list is still
+      // full, the next run holds the same nodes back again, and that run has to
+      // resume watching them (stopRevealWatch left deferredSeen intact).
+      if (deferredNodes.length) startRevealWatch();
+      return 0;
+    }
+    var d = prioritySettings();
+    log.info('deferring ' + fresh + ' hidden text node(s) until the page shows them; ' +
+      deferredNodes.length + ' waiting (re-check ' + d.revealDebounceMs + 'ms after a style change, ' +
+      'and every ' + d.revealIntervalMs + 'ms)');
+    startRevealWatch();
+    return fresh;
+  }
+
+  // Forget everything we were waiting for (restoreAll, or a caller that knows
+  // the page state changed completely).
+  function forgetDeferred(why) {
+    var n = deferredNodes.length;
+    deferredNodes = [];
+    deferredSeen.clear();
+    stopRevealWatch(why ? (why + ' (' + n + ' node(s) forgotten)') : null);
+    return n;
+  }
+
+  // What is still waiting to be displayed, for the console: __plamo.getDeferred().
+  function deferredSample(limit) {
+    var max = (limit == null) ? 10 : limit;
+    return {
+      waiting: deferredNodes.length,
+      watching: !!(revealObserver || revealPoll || revealTimer),
+      attrs: REVEAL_ATTRS.slice(),
+      stats: Object.assign({}, revealStats),
+      sample: deferredNodes.slice(0, max).map(function (entry) {
+        var parent = entry.parent;
+        return {
+          path: ns.segmenter.describePath(parent),
+          tag: (parent && parent.tagName) || '',
+          text: String((entry.node && entry.node.nodeValue) || '').replace(/\s+/g, ' ').trim().slice(0, 60)
+        };
+      })
+    };
+  }
+
+  // One check per burst of style changes, not one per mutation: opening a menu
+  // touches a class, a style and an aria attribute at once.
+  function scheduleReveal(ms) {
+    if (revealTimer || !deferredNodes.length) return;
+    var d = prioritySettings();
+    revealTimer = setTimeout(function () {
+      revealTimer = null;
+      checkRevealed('scan');
+    }, ms || d.revealDebounceMs);
+    if (revealTimer.unref) revealTimer.unref(); // never hold a page (or a test run) open
+  }
+
+  // The watcher exists only while hidden text is waiting: a page with nothing
+  // deferred costs nothing to watch.
+  function startRevealWatch() {
+    if (!deferredNodes.length) return;
+    if (!ns.priority || !ns.priority.createVisibility) {
+      log.warn('reveal: content/priority.js is not loaded before content.js; ' +
+        deferredNodes.length + ' hidden text node(s) are dropped instead of waited for');
+      forgetDeferred('no priority module');
+      return;
+    }
+    if (!revealPoll) {
+      var d = prioritySettings();
+      // The interval is the fallback for a page that shows text through a rule we
+      // never see change (an ancestor class, a stylesheet swap). The observer is
+      // the fast path; the interval only runs while something is still waiting.
+      revealPoll = setInterval(function () { checkRevealed('poll'); }, d.revealIntervalMs);
+      if (revealPoll.unref) revealPoll.unref();
+    }
+    if (!revealObserver && typeof MutationObserver === 'function') {
+      var observed = document.documentElement || document.body;
+      if (observed) {
+        revealObserver = new MutationObserver(function (records) {
+          var attrs = {};
+          records.forEach(function (r) { attrs[r.attributeName] = (attrs[r.attributeName] || 0) + 1; });
+          log.trace('reveal: ' + records.length + ' attribute change(s) ' + JSON.stringify(attrs));
+          scheduleReveal();
+        });
+        revealObserver.observe(observed, { attributes: true, subtree: true, attributeFilter: REVEAL_ATTRS });
+        log.trace('reveal: watching ' + REVEAL_ATTRS.join('/') + ' under <' + String(observed.nodeName).toLowerCase() + '>');
+      }
+    }
+    scheduleReveal();
+  }
+
+  function stopRevealWatch(why) {
+    if (revealObserver) { try { revealObserver.disconnect(); } catch (e) { /* already gone */ } revealObserver = null; }
+    if (revealPoll) { clearInterval(revealPoll); revealPoll = null; }
+    if (revealTimer) { clearTimeout(revealTimer); revealTimer = null; }
+    if (why) log.info('reveal watch stopped: ' + why);
+  }
+
+  // Is any held-back node visible now? A node the page took out of the document
+  // is dropped — nobody will ever read it. A node we already rewrote is dropped
+  // too, so re-opening the same menu does not pay for the same text twice.
+  function checkRevealed(why) {
+    if (!deferredNodes.length) { stopRevealWatch('nothing waiting'); return []; }
+    if (!document.body) return [];
+    var t0 = performance.now();
+    var d = prioritySettings();
+    var vis = ns.priority.createVisibility(document.body, { maxHiddenChecks: d.maxHiddenChecks });
+    var ready = [];
+    var kept = [];
+    deferredNodes.forEach(function (entry) {
+      revealStats.checks++;
+      if (!vis.attached(entry.parent)) {
+        revealStats.detached++;
+        deferredSeen.delete(entry.node);
+        return;
+      }
+      if (renderer.isApplied(entry.node)) {
+        revealStats.alreadyTranslated++;
+        deferredSeen.delete(entry.node);
+        return;
+      }
+      if (vis.hidden(entry.parent)) { kept.push(entry); return; }
+      deferredSeen.delete(entry.node);
+      ready.push(entry.node);
+    });
+    deferredNodes = kept;
+    revealStats.scans++;
+    revealStats.revealed += ready.length;
+    revealStats.lastScanMs = Math.round(performance.now() - t0);
+    revealStats.at = new Date().toISOString();
+    log.info('reveal scan (' + why + '): ' + ready.length + ' of ' + (ready.length + kept.length) +
+      ' hidden node(s) displayed now, ' + kept.length + ' still hidden, ' + revealStats.detached +
+      ' detached, ' + revealStats.alreadyTranslated + ' already translated (' +
+      revealStats.lastScanMs + 'ms, visibility ' + JSON.stringify(vis.stats()) + ')');
+    if (!deferredNodes.length) stopRevealWatch('nothing waiting');
+    if (ready.length) translateRevealed(ready);
+    return ready;
+  }
+
+  // Put nodes back on the waiting list: the reveal scan already took them out,
+  // and nothing was sent for them yet.
+  function holdRevealed(nodes) {
+    (nodes || []).forEach(function (node) {
+      if (!node || deferredSeen.has(node)) return;
+      deferredSeen.add(node);
+      deferredNodes.push({ node: node, parent: node.parentNode });
+    });
+    return deferredNodes.length;
+  }
+
+  // A run owns the pipeline, so a reveal that lands while one is in flight is
+  // handed back to the next scan instead of fighting the packer for the same
+  // text nodes. Stop is honoured the same way: it means "no more requests", and
+  // the nodes stay on the waiting list for the run the user asks for next.
+  function translateRevealed(nodes) {
+    if (abortRequested) {
+      holdRevealed(nodes);
+      log.info('reveal: ' + nodes.length + ' displayed node(s) are not translated: Stop is in effect ' +
+        '(' + deferredNodes.length + ' waiting, __plamo.translatePage() starts a run that picks them up)');
+      stopRevealWatch('stop is in effect');
+      return null;
+    }
+    if (live && live.phase && live.phase !== 'idle') {
+      log.info('reveal: ' + nodes.length + ' node(s) wait for run#' + live.runId + ' to finish');
+      holdRevealed(nodes);
+      scheduleReveal(prioritySettings().revealIntervalMs);
+      return null;
+    }
+    log.info('reveal: translating ' + nodes.length + ' node(s) the page just displayed');
+    return translatePage(document.body || document, { nodes: nodes }).catch(function (err) {
+      log.warn('reveal run failed: ' + lastErrorMessage(err)); // translatePage logged the details
+    });
   }
 
   var manifestVersion = null;
@@ -750,6 +1065,14 @@
     // One row per text node whose nodeValue we replaced: { path, before, after }.
     getApplied: function (limit) { return renderer.appliedSample(limit); },
     scanStats: function () { return ns.extractor.scanStats(); },
+    // What the last scan saw per region, and what it refused to send (skipped).
+    getSegmentStats: function () { return ns.segmenter.lastStats(); },
+    // The hidden text a scan held back and what the reveal watch has done with
+    // it. revealNow() forces the "is it displayed yet?" check; forgetDeferred()
+    // drops the list (a page that was re-rendered from scratch).
+    getDeferred: function (limit) { return deferredSample(limit); },
+    revealNow: function () { return checkRevealed('console'); },
+    forgetDeferred: function () { return forgetDeferred('console'); },
     getLogs: function (opts) { return ns.logger.getLogs(opts); },
     dumpLogs: function (opts) { return ns.logger.dumpLogs(opts); },
     clearLogs: function () { return ns.logger.clearLogs(); },
@@ -758,7 +1081,7 @@
     backgroundLogs: backgroundLogs,
     pingBackground: pingBackground,
     // actions
-    translatePage: function (root) { return translatePage(root); },
+    translatePage: function (root, opts) { return translatePage(root, opts); },
     restoreAll: function (root) { return restoreAll(root); },
     // Undo one text node (pass the Text node itself) — console debugging.
     restoreText: function (node) { return restoreNode(node); },
@@ -773,7 +1096,12 @@
     translateSegment: function (segment, opts) { return translateSegment(getProfile(settings.profileName), segment, opts); }
   };
 
+  var prio0 = prioritySettings();
   log.info('content script ready v' + manifestVersion +
-    ' (diagnostics: __plamo.getState(), __plamo.getPending(), __plamo.dumpLogs(), __plamo.pingBackground())');
+    ' (send order ' + ((C.PRIORITY_ROLES || []).join(' > ') || 'viewport only') +
+    ', deferHidden=' + prio0.deferHidden + ', re-check hidden text ' + prio0.revealDebounceMs +
+    'ms after a style change and every ' + prio0.revealIntervalMs + 'ms)');
+  log.info('diagnostics: __plamo.getState(), __plamo.getPending(), __plamo.getDeferred(), ' +
+    '__plamo.getBatchPlan(), __plamo.dumpLogs(), __plamo.pingBackground()');
   setStatus('idle');
 })();

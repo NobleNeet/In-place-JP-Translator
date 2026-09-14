@@ -29,6 +29,7 @@ plamo-page-translator/
 │   ├── content.js           # orchestrator: extract -> segment -> batch -> apply
 │   ├── extractor.js         # collects translatable *text nodes* (never elements)
 │   ├── segmenter.js         # one segment per text node, language heuristic, block keys, tokens, priority
+│   ├── priority.js          # which region a text node sits in, and whether the user can see it
 │   └── renderer.js          # writes nodeValue only, registry for restore
 ├── api/
 │   ├── profiles.js          # API profiles (endpoints, model, apiKey)
@@ -181,6 +182,10 @@ window.__plamo.getBatchPlan()  // how the next run would be packed: { segments, 
 window.__plamo.getBatcherCaps()// the caps the packer in use was built with (proves a saved setting landed)
 window.__plamo.getChannel()    // { kind: 'port'|'none', name, requests, pending } — is the run on the durable channel?
 window.__plamo.getRecoveryCaps()// { maxSegmentsPerRequest, maxRequests } used when a request dies in transport
+window.__plamo.getSegmentStats()// last scan: { nodes, visibleNodes, hiddenNodes, deferred, deferHidden, segments, blocks, roles, skipped }
+window.__plamo.getDeferred(20) // text a run held back: { waiting, watching, attrs, stats, sample }
+window.__plamo.revealNow()     // force the "is that hidden text displayed yet?" check
+window.__plamo.forgetDeferred()// drop the waiting list (a page that re-rendered from scratch)
 ```
 
 ---
@@ -233,6 +238,10 @@ All of these are in the popup and apply to the **next** "Translate Page" press.
 - **Request packing**: `multi` (default — one request per batch, one text node
   per line) or `single` (one request per text node, i.e. the previous
   behaviour, kept for A/B comparison).
+- **Hidden text**: `wait until it is shown` (default — the text of a closed menu
+  or a tab panel is held back and translated when it is displayed, so it costs no
+  request the reader never waits for) or `translate at once` (send hidden text
+  with the rest of the page). See *Text the reader cannot see* below.
 
 Packing never cuts a block in half: the fragments of one `<p>` (text around an
 inline `<a>` or `<strong>`) and the items of one menu or list always stay in the
@@ -287,6 +296,54 @@ attempt per segment, while a 404/connection error is *not* retried 16 times
 failed (http_error)`). The retry sizes are `RECOVERY.maxSegmentsPerRequest` (6)
 and `RECOVERY.maxRequests` (12) in `shared/constants.js`.
 
+### Text the reader cannot see (held back, then translated when it is shown)
+
+A closed dropdown, a tab panel behind `display:none` and a mobile menu repeat the
+page several times over, and the hidden copy is not text anybody is reading. By
+default such text is **not sent at all**: the run holds it back and the start line
+says so (`deferred=4 deferHidden=true`). `content/priority.js` answers the
+question — attributes first (`hidden`, or an inline `style` containing
+`display:none` / `visibility:hidden|collapse`), then `getComputedStyle` per
+element, walking up the ancestor chain and stopping at the first hidden ancestor,
+so a closed menu subtree costs one CSS lookup instead of one per item. A scan
+asks the CSS at most `maxHiddenChecks` (6000) questions and logs a warning when it
+runs out; past that it assumes visible, which is what every build before this
+assumed all the time.
+
+Every text node also gets a **region**, and the region is what decides the order
+the rest of the page is sent in: hidden first out of the way, then the class
+(`content`, then `heading`, then `navigation`, then whatever is left), then the
+viewport band inside a class, then the order the tree was walked. The markers are
+`MAIN`/`ARTICLE`, `role=main|article|feed` and class words like `article`/`post`/
+`content` for the body; `H1`–`H6` for headings; `NAV`/`HEADER`/`FOOTER`/`ASIDE`/
+`MENU`, `role=navigation|menu|menubar|tablist|toolbar|search|banner|contentinfo|
+complementary` and class/id words like `nav`/`menu`/`sidebar`/`footer`/`toc` for
+page chrome — chrome wins, because being inside a menu is secondary whatever tag
+you are. A run of 120+ characters with no marker at all counts as body text
+instead of being made to wait behind the menu. `__plamo.getState().roles` and the
+`roles={...}` in the run log show what a page is made of, which is how "it
+translated the menu before the article" gets answered with numbers.
+
+Once a run holds text back, a **reveal watch** covers it: a `MutationObserver` on
+`style`, `class`, `hidden`, `aria-hidden`, `inert` and `open` (subtree) triggers a
+re-check of the queued nodes `revealDebounceMs` (250 ms) after the last change —
+opening a menu touches a class, a style and an aria attribute at once, and one
+check per burst is enough — plus a fallback poll every `revealIntervalMs` (4 s)
+for sites that animate without touching any of those attributes. A node that
+turns out to be displayed is translated by a run of its own; a node the run sent,
+or that a reveal already rewrote, leaves the queue, so a menu opened between two
+runs costs one small request instead of a re-read of the whole page. `Stop` ends
+the watch but keeps the queue, so the next run picks the same nodes up (while Stop
+is in effect a displayed node is *not* translated — it goes back on the queue
+instead of being lost). `Restore` empties the queue, because nothing is being
+waited for any more. `__plamo.getDeferred()` shows what is still waiting.
+
+To send hidden text with the rest of the page instead, choose *Hidden text →
+translate at once* in the popup (it applies to the next "Translate Page" press).
+The knobs live under `priority` in `chrome.storage.local` — `deferHidden`,
+`revealDebounceMs`, `revealIntervalMs`, `maxHiddenChecks` — with defaults in
+`PRIORITY_SETTINGS` in `shared/constants.js`.
+
 ---
 
 ## Implemented features (Phase 1)
@@ -300,6 +357,9 @@ and `RECOVERY.maxRequests` (12) in `shared/constants.js`.
 - [x] Language heuristic (skips obvious non-English)
 - [x] Loose token estimation (separated function)
 - [x] Viewport priority (visible → near → rest)
+- [x] Region priority (article body → headings → page chrome) and hidden text
+      held back until it is displayed, with a reveal watch on `style`/`class`/
+      `hidden`/`aria-hidden`/`inert`/`open` (debounced re-check + fallback poll)
 - [x] Bounded batching (count + estimated tokens) with block-aware packing
 - [x] Multi-segment-per-request batching: one request carries a whole batch
       (one text node per line), mapped back by line count
@@ -320,7 +380,9 @@ and `RECOVERY.maxRequests` (12) in `shared/constants.js`.
 ## Not yet implemented (later phases)
 
 - [ ] `fallback` / `balanced` connection modes (structure only)
-- [ ] Full priority queue + `IntersectionObserver` viewport streaming
+- [ ] `IntersectionObserver` viewport streaming — the bands are measured with
+      `getBoundingClientRect()` at scan time (on screen / within 400 px / rest), so
+      a node that scrolls into view while a run is going keeps the band it had
 - [ ] SPA support via `MutationObserver` + debounce
 - [ ] Persistent cache
 - [ ] Auto-translate on load / per-domain allowlist

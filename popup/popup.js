@@ -103,6 +103,12 @@
       if (concSel) concSel.value = String(clampConcurrent(settings.maxConcurrent));
       var stratSel = $('strategy');
       if (stratSel) stratSel.value = clampStrategy(settings.request && settings.request.strategy);
+      // Only the boolean is surfaced in the popup; the reveal timings stay at
+      // their defaults (settings.js clamps anything typed into storage).
+      var hiddenSel = $('hidden');
+      if (hiddenSel) {
+        hiddenSel.value = (settings.priority && settings.priority.deferHidden === false) ? 'now' : 'defer';
+      }
       var segSel = $('segments');
       if (segSel) {
         // A saved cap that is not one of the preset sizes (an older build, or a
@@ -225,6 +231,17 @@
         if (!isFinite(n) || n < 1) return;
         settings.batch = Object.assign({}, settings.batch, { maxSegmentsPerBatch: n });
         saveSettings({ batch: settings.batch });
+      });
+    }
+    // The segmenter reads this when a run starts, so it applies to the next
+    // "Translate Page" press. A run that already held text back keeps watching
+    // for that text until it is displayed or Stop / Restore is pressed.
+    var hiddenSel = $('hidden');
+    if (hiddenSel) {
+      hiddenSel.addEventListener('change', function () {
+        var defer = $('hidden').value !== 'now';
+        settings.priority = Object.assign({}, settings.priority || {}, { deferHidden: defer });
+        saveSettings({ priority: settings.priority });
       });
     }
   }

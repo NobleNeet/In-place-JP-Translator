@@ -13,6 +13,18 @@
 // The extractor hands over individual Text nodes and the renderer only ever
 // assigns node.nodeValue, so the element tree is never modified and the layout
 // cannot change.
+//
+// WHAT IS RETURNED: collect(root) -> { visible: Text[], hidden: Text[] } (both in
+// document order). Text the user cannot see right now — display:none,
+// visibility:hidden, [hidden] — is collected too, but apart: a closed menu, a
+// modal and a mobile header are all copies of text nobody is reading, and each is
+// translated when it is displayed rather than up front. The rules for hidden text
+// and for the article/menu/heading ordering live in content/priority.js; this file
+// only splits, it never throws away. extractTextNodes(root) returns the visible
+// part only.
+//
+// Exports: collect, extractTextNodes, extractTextNodesSplit, shouldIgnore,
+//          isTranslatableText, scanStats
 (function () {
   var ns = globalThis.__PLAMO__;
   var log = ns.logger.log;
@@ -65,8 +77,11 @@
     var editable = getAttr(el, 'contenteditable');
     if (editable && String(editable).toLowerCase() !== 'false') return true;
     if (el.isContentEditable === true) return true; // set from script, no attribute
-    var style = getAttr(el, 'style');
-    if (style && /display\s*:\s*none|visibility\s*:\s*hidden/.test(style)) return true;
+    // NOTE: display:none / visibility:hidden is deliberately NOT checked here any
+    // more. Hidden text is still collected, but separately from the visible text,
+    // so it can be translated when it is displayed instead of never (see
+    // content/priority.js and collect() below). This list stays for subtrees that
+    // must never be touched at all: code, form state, SVG layout, <head>.
     var cls = classString(el);
     if (cls) {
       var names = cls.split(/\s+/);
@@ -110,7 +125,20 @@
     return true;
   }
 
-  var lastScan = { root: null, elements: 0, skippedSubtrees: 0, textNodes: 0, skippedText: 0, at: 0 };
+  var lastScan = { root: null, elements: 0, skippedSubtrees: 0, textNodes: 0, skippedText: 0,
+    hiddenText: 0, styleLookups: 0, at: 0 };
+
+  // ns.priority, with a loud warning when it is missing: load order in
+  // manifest.json decides this, and a silent "everything is visible" answer is
+  // the kind of bug that costs hours on a real page.
+  function priorityModule() {
+    if (!ns.priority) {
+      log.warn('extractor: content/priority.js is not loaded before extractor.js; ' +
+        'hidden text is treated as visible and translated right away');
+      return null;
+    }
+    return ns.priority;
+  }
 
   // One segment per *direct* text child: that is what keeps one piece of text
   // from becoming one segment per ancestor. A single TreeWalker over elements
@@ -118,20 +146,27 @@
   // the order it is displayed even when it contains inline <a>/<strong> etc.
   // Elements are only gates (FILTER_SKIP descends into them, FILTER_REJECT
   // drops their whole subtree); the nodes handed back are always Text nodes.
-  function extractTextNodes(root, opts) {
+  //
+  // -> { visible: Text[], hidden: Text[] }, both in document order. `hidden`
+  // holds the text nodes the user cannot see right now: real text on the page,
+  // just not text anybody is reading at this moment (see content/priority.js).
+  function collect(root, opts) {
     root = root || (typeof document !== 'undefined' ? document : null);
-    if (!root) { log.warn('extract: no root to walk'); return []; }
-    var nodes = [];
+    if (!root) { log.warn('extract: no root to walk'); return { visible: [], hidden: [] }; }
+    var visible = [];
+    var hidden = [];
     if (root.nodeType === 1 && shouldIgnore(root)) {
       log.warn('extract: root ' + (tagNameOf(root) || 'node') + ' is on the skip list, nothing to do');
-      return nodes;
+      return { visible: visible, hidden: hidden };
     }
     var doc = root.ownerDocument || root;
     var limits = bounds(opts);
     var skippedSubtrees = 0;
     var NF = globalThis.NodeFilter;
+    var prio = priorityModule();
+    var vis = prio ? prio.createVisibility(root, opts && opts.visibility) : null;
     lastScan = { root: (root.nodeType === 9) ? 'document' : tagNameOf(root), elements: 0,
-      skippedSubtrees: 0, textNodes: 0, skippedText: 0, at: Date.now() };
+      skippedSubtrees: 0, textNodes: 0, skippedText: 0, hiddenText: 0, styleLookups: 0, at: Date.now() };
     var walker;
     try {
       walker = doc.createTreeWalker(root, NF.SHOW_ELEMENT | NF.SHOW_TEXT, {
@@ -148,21 +183,40 @@
       });
     } catch (e) {
       log.error('extract: createTreeWalker failed: ' + ((e && e.message) || e));
-      return nodes;
+      return { visible: visible, hidden: hidden };
     }
     var node;
-    while ((node = walker.nextNode())) nodes.push(node);
+    while ((node = walker.nextNode())) {
+      // The one question asked per collected node: can the user see it?
+      if (vis && vis.hidden(node.parentNode)) hidden.push(node);
+      else visible.push(node);
+    }
     lastScan.skippedSubtrees = skippedSubtrees;
-    log.debug('extract: ' + nodes.length + ' translatable text node(s) under ' + lastScan.root +
-      ' (elements=' + lastScan.elements + ' skipped-subtrees=' + skippedSubtrees +
-      ' text-nodes=' + lastScan.textNodes + ' skipped-text=' + lastScan.skippedText + ')');
-    return nodes;
+    lastScan.hiddenText = hidden.length;
+    if (vis) {
+      var vs = vis.stats();
+      lastScan.styleLookups = vs.styleLookups;
+      lastScan.hiddenElements = vs.hiddenElements;
+      lastScan.visibilityBudgetHit = vs.budgetHit;
+    }
+    log.debug('extract: ' + visible.length + ' visible + ' + hidden.length + ' hidden text node(s) under ' +
+      lastScan.root + ' (elements=' + lastScan.elements + ' skipped-subtrees=' + skippedSubtrees +
+      ' text-nodes=' + lastScan.textNodes + ' skipped-text=' + lastScan.skippedText +
+      ' css-lookups=' + lastScan.styleLookups + ')');
+    return { visible: visible, hidden: hidden };
   }
+
+  // The visible part only: what a run sends right now.
+  function extractTextNodes(root, opts) { return collect(root, opts).visible; }
+  // Both parts, so the caller can hold the hidden part back (see content/content.js).
+  function extractTextNodesSplit(root, opts) { return collect(root, opts); }
 
   function scanStats() { return Object.assign({}, lastScan); }
 
   ns.extractor = {
     extractTextNodes: extractTextNodes,
+    extractTextNodesSplit: extractTextNodesSplit,
+    collect: collect,
     // Old names, kept working (same semantics: text nodes, not elements).
     extractReadableElements: extractTextNodes,
     collectTextNodes: extractTextNodes,
