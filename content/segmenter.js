@@ -68,6 +68,34 @@
     return 3;
   }
 
+  // --- structural grouping ----------------------------------------------------
+  // Element -> id, only for the current build: cleared at the start of every
+  // buildSegments() run, so ids stay small and never leak between runs.
+  var elementIds = new Map();
+  var BLOCK_TAGS = new Set((ns.constants && ns.constants.BLOCK_TAGS) || []);
+
+  function elementId(el) {
+    var n = elementIds.get(el);
+    if (n == null) { n = elementIds.size + 1; elementIds.set(el, n); }
+    return n;
+  }
+
+  // The "paragraph" a text node belongs to: climb to the nearest block-level
+  // ancestor. Inline wrappers (<a>, <strong>, <span>) are climbed through, so
+  // every fragment of one <p> gets the same id and therefore goes into the same
+  // request — a sentence cut in half by a link is not translated twice apart.
+  function blockOf(parent) {
+    var el = parent;
+    var guard = 0;
+    while (el && el.nodeType === 1 && guard++ < 64) {
+      if (BLOCK_TAGS.has(String(el.tagName || '').toUpperCase())) return el;
+      var up = el.parentNode;
+      if (!up || up.nodeType !== 1) return el; // nothing above: this is the top
+      el = up;
+    }
+    return el;
+  }
+
   // opts.nodes lets a caller pass pre-collected text nodes; opts.elements is
   // accepted (and ignored) so an old call site does not silently re-translate
   // the whole page through the element path.
@@ -77,6 +105,7 @@
       log.warn('segmenter: element-based segments are not supported any more ' +
         '(they replace whole subtrees and break the layout); collecting text nodes instead');
     }
+    elementIds.clear();
     var nodes = opts.nodes || ns.extractor.extractTextNodes(root, opts.extract);
     var segments = [];
     var skipped = { empty: 0, language: 0, detached: 0 };
@@ -90,11 +119,18 @@
       if (!text) { skipped.empty++; continue; }
       if (!opts.includeNonEnglish && !isLikelyEnglish(text)) { skipped.language++; continue; }
       var parent = node.parentNode;
+      var block = blockOf(parent);
+      var container = (block.parentNode && block.parentNode.nodeType === 1) ? block.parentNode : block;
       segments.push({
         id: 'seg-' + (id++),
         text: text,
         estimatedTokens: estimateTokens(text),
         viewport: viewportPriority(parent),
+        // Grouping keys for the request packer (translation/batcher.js): segments
+        // with the same block never get split across requests, and consecutive
+        // segments of the same container (a menu, a list) fill one request.
+        block: 'b' + elementId(block),
+        container: 'c' + elementId(container),
         // Everything the renderer needs to write this translation back into the
         // same text node (and to undo it later). Never crosses the wire.
         source: {
@@ -109,8 +145,14 @@
       });
     }
     log.debug('segmenter: built ' + segments.length + ' segment(s) from ' + nodes.length +
-      ' text node(s) skipped ' + JSON.stringify(skipped));
+      ' text node(s) in ' + countKeys(segments, 'block') + ' block(s) skipped ' + JSON.stringify(skipped));
     return segments;
+  }
+
+  function countKeys(segments, key) {
+    var seen = new Set();
+    segments.forEach(function (s) { if (s[key]) seen.add(s[key]); });
+    return seen.size;
   }
 
   // Viewport band first, document order inside a band (Array#sort is stable, so

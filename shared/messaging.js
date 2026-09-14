@@ -80,6 +80,9 @@
     return {
       index: batch.index,
       estimatedTokens: batch.estimatedTokens,
+      // How many blocks this one request carries: 1 request / many units is the
+      // whole point of the batching, so it has to be visible in the logs.
+      units: batch.units,
       segments: (batch.segments || []).map(toWireSegment)
     };
   }
@@ -180,6 +183,7 @@
     var segs = batch.segments || [];
     var chars = segs.reduce(function (sum, s) { return sum + String(s.text || '').length; }, 0);
     return 'segments=' + segs.length + ' chars=' + chars + ' estTokens=' + batch.estimatedTokens +
+      (batch.units != null ? (' units=' + batch.units) : '') +
       ' ids=[' + segs.slice(0, 12).map(function (s) { return s.id; }).join(',') + ']' +
       (segs.length > 12 ? '…' : '');
   }
@@ -189,6 +193,7 @@
     var out = 'type=' + msg.type + ' id=' + (msg.id || '-');
     if (msg.batch) out += ' ' + summarizeBatch(msg.batch);
     if (msg.profileName != null) out += ' profile=' + msg.profileName;
+    if (msg.strategy != null) out += ' strategy=' + msg.strategy;
     if (msg.concurrency != null) out += ' concurrency=' + msg.concurrency;
     if (msg.timeoutMs != null) out += ' timeoutMs=' + msg.timeoutMs;
     if (msg.cache) out += ' cache=' + Object.keys(msg.cache).length + ' entr(y/ies)';

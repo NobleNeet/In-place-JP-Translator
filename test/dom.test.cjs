@@ -3,8 +3,10 @@
 // Layout-safety tests for the text-node pipeline (extractor -> segmenter ->
 // renderer). This repository has no jsdom dependency, so a small DOM is
 // implemented right here: elements, text nodes, attributes and a TreeWalker over
-// elements + text nodes — exactly the surface those three modules touch (they
-// are deliberately duck-typed, they never use instanceof on DOM hosts).
+// elements + text nodes — exactly the surface those modules touch (they are
+// deliberately duck-typed, they never use instanceof on DOM hosts). The packer
+// is loaded too, so the grouping keys the segmenter assigns get checked where
+// the nodes are real elements.
 //
 // What these tests guard:
 //   * a text node is collected once, never once per ancestor element;
@@ -14,7 +16,9 @@
 //     every attribute and every untouched text node stay byte-identical;
 //   * leading/trailing whitespace survives, so inline siblings do not glue;
 //   * restore()/restoreAll() put the original values back and leave no
-//     attributes behind.
+//     attributes behind;
+//   * the fragments of one paragraph (text around an inline link) and the items
+//     of one list are packed into the same API request, never split apart.
 //
 // Run: node test/dom.test.cjs
 
@@ -26,7 +30,7 @@ const path = require('node:path');
 
 const dir = path.join(__dirname, '..');
 const order = ['shared/logger.js', 'shared/constants.js', 'content/extractor.js',
-  'content/segmenter.js', 'content/renderer.js'];
+  'content/segmenter.js', 'content/renderer.js', 'translation/batcher.js'];
 
 // --- mini DOM -----------------------------------------------------------------
 class MiniNode {
@@ -317,6 +321,40 @@ ok('link text is its own segment', !!linkSeg && linkSeg.source.parentTag === 'A'
 const pSegs = segs.filter((s) => s.source.parentTag === 'P' && /Welcome/.test(s.text));
 ok('a <p> yields one segment, not one per ancestor', pSegs.length === 1);
 ok('path points at the parent element', !!pSegs[0] && /\.lead$/.test(pSegs[0].source.path), pSegs[0] && pSegs[0].source.path);
+console.log('== segmenter: block / container grouping keys ==');
+const linkTrio = [beforeLink, linkSeg, afterLink];
+ok('every segment carries both grouping keys', segs.every((s) => !!s.block && !!s.container));
+ok('inline siblings around a link share one block', linkTrio.every((s) => !!s && !!s.block) &&
+  new Set(linkTrio.map((s) => s.block)).size === 1, linkTrio.map((s) => s && s.block));
+const welcomeSeg = segs.filter((s) => s.text === 'Welcome to the product.')[0];
+ok('another paragraph is another block', !!welcomeSeg && linkTrio[0].block !== welcomeSeg.block,
+  [linkTrio[0].block, welcomeSeg && welcomeSeg.block]);
+const itemSegs = ['First item', 'Second item'].map((t) => segs.filter((s) => s.text === t)[0]);
+ok('list items are separate blocks', itemSegs.every((s) => !!s) && itemSegs[0].block !== itemSegs[1].block,
+  itemSegs.map((s) => s && s.block));
+ok('list items share one container', !!itemSegs[0] && itemSegs[0].container === itemSegs[1].container && !!itemSegs[0].container,
+  itemSegs.map((s) => s && s.container));
+
+console.log('== packer: a paragraph or menu is not split across requests ==');
+const packer = ns.createBatcher({
+  maxSegmentsPerBatch: ns.constants.BATCH_SETTINGS.maxSegmentsPerBatch,
+  maxEstimatedTokensPerBatch: ns.constants.BATCH_SETTINGS.maxEstimatedTokensPerBatch,
+  firstBatchMaxSegments: ns.constants.BATCH_SETTINGS.maxSegmentsPerBatch
+});
+const packs = packer.batchUnits(segmenter.sortSegmentsByViewport(segs));
+const inSameBatch = (a, b) => packs.some((bt) => bt.segments.indexOf(a) !== -1 && bt.segments.indexOf(b) !== -1);
+ok('nothing lost or duplicated by the packer', packs.reduce((n, bt) => n + bt.segments.length, 0) === segs.length,
+  [packs.reduce((n, bt) => n + bt.segments.length, 0), segs.length]);
+ok('this small page fits in one request', packs.length === 1, packs.map((bt) => bt.segments.length));
+ok('the fragments around a link are not split', inSameBatch(beforeLink, linkSeg) && inSameBatch(linkSeg, afterLink));
+ok('list items travel together', inSameBatch(itemSegs[0], itemSegs[1]));
+const tightPacker = ns.createBatcher({ maxSegmentsPerBatch: 3, maxEstimatedTokensPerBatch: 100000, firstBatchMaxSegments: 3 });
+const tightPacks = tightPacker.batchUnits(segmenter.sortSegmentsByViewport(segs));
+ok('a block bigger than the cap stays whole instead of being cut',
+  tightPacks.some((bt) => linkTrio.every((s) => bt.segments.indexOf(s) !== -1)), tightPacks.map((bt) => bt.segments.length));
+ok('tight packing still covers every segment',
+  tightPacks.reduce((n, bt) => n + bt.segments.length, 0) === segs.length && tightPacks.length > 1,
+  tightPacks.map((bt) => bt.segments.length));
 const h1El = documentMock.querySelectorAll('h1')[0];
 h1El._rect = { top: 5000, bottom: 5040, left: 0, right: 600 }; // far below the fold
 const segs2 = segmenter.buildSegments(documentMock);

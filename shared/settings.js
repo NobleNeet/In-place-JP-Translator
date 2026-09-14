@@ -13,7 +13,16 @@
       batch: {
         maxSegmentsPerBatch: C.BATCH_SETTINGS.maxSegmentsPerBatch,
         maxEstimatedTokensPerBatch: C.BATCH_SETTINGS.maxEstimatedTokensPerBatch,
-        charPerToken: C.BATCH_SETTINGS.charPerToken
+        charPerToken: C.BATCH_SETTINGS.charPerToken,
+        firstBatchMaxSegments: C.BATCH_SETTINGS.firstBatchMaxSegments
+      },
+      // How segments are packed into API requests (see api/openai-client.js).
+      request: {
+        strategy: C.REQUEST_SETTINGS.strategy,
+        format: C.REQUEST_SETTINGS.format,
+        retryWithNumbers: C.REQUEST_SETTINGS.retryWithNumbers,
+        perSegmentFallback: C.REQUEST_SETTINGS.perSegmentFallback,
+        batchSystemPrompt: C.REQUEST_SETTINGS.batchSystemPrompt
       }
     };
   }
@@ -25,7 +34,8 @@
     var maxConcurrent = clampConcurrent(patch.maxConcurrent);
     return Object.assign({}, base, patch, {
       maxConcurrent: maxConcurrent,
-      batch: Object.assign({}, base.batch, (patch.batch || {}))
+      batch: Object.assign({}, base.batch, (patch.batch || {})),
+      request: Object.assign({}, base.request, (patch.request || {}), { strategy: clampStrategy((patch.request || {}).strategy) })
     });
   }
 
@@ -42,12 +52,20 @@
     return C.CONCUR_OPTIONS.filter(function (c) { return c >= n; })[0] || C.CONCUR_OPTIONS[C.CONCUR_OPTIONS.length - 1];
   }
 
+  // Only the two strategies that exist: an unknown/absent stored value falls
+  // back to the default instead of switching a user off to no batching at all.
+  function clampStrategy(value) {
+    if (C.REQUEST_STRATEGIES.indexOf(value) !== -1) return value;
+    return C.REQUEST_SETTINGS.strategy;
+  }
+
   function isModeSupported(mode) { return C.MODES.indexOf(mode) !== -1; }
 
   ns.settings = {
     loadSettings: loadSettings,
     saveSettings: saveSettings,
     clampConcurrent: clampConcurrent,
+    clampStrategy: clampStrategy,
     isModeSupported: isModeSupported,
     defaultSettings: defaultSettings
   };

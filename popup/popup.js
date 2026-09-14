@@ -8,6 +8,7 @@
   var loadSettings = ns.settings.loadSettings;
   var saveSettings = ns.settings.saveSettings;
   var clampConcurrent = ns.settings.clampConcurrent;
+  var clampStrategy = ns.settings.clampStrategy;
   var profileNames = ns.profiles.profileNames;
   var MSG_TRANSLATE_PAGE = ns.constants.MSG_TRANSLATE_PAGE;
   var MSG_RESTORE = ns.constants.MSG_RESTORE;
@@ -17,11 +18,12 @@
   var settings = {};
   var status = 'idle';
   var lastError = null;
-  var counts = { segments: 0, translated: 0, failed: 0 };
+  var counts = { segments: 0, translated: 0, failed: 0, requests: 0 };
 
   function render() {
     if ($('status')) $('status').textContent = status;
     if ($('segCount')) $('segCount').textContent = counts.segments;
+    if ($('reqCount')) $('reqCount').textContent = counts.requests;
     if ($('transCount')) $('transCount').textContent = counts.translated;
     if ($('failCount')) $('failCount').textContent = counts.failed;
     var errEl = $('lastError');
@@ -38,7 +40,7 @@
     if (res.error) return 'ERROR [' + (res.errorType || '?') + '] ' + res.error;
     return JSON.stringify({
       total: res.total, translated: res.translated, failed: res.failed, applied: res.applied,
-      cacheHits: res.cacheHits, elapsedMs: res.elapsedMs, phase: res.phase
+      requests: res.requests, cacheHits: res.cacheHits, elapsedMs: res.elapsedMs, phase: res.phase
     });
   }
 
@@ -99,6 +101,23 @@
       if (profileSel) profileSel.value = settings.profileName;
       var concSel = $('concurrency');
       if (concSel) concSel.value = String(clampConcurrent(settings.maxConcurrent));
+      var stratSel = $('strategy');
+      if (stratSel) stratSel.value = clampStrategy(settings.request && settings.request.strategy);
+      var segSel = $('segments');
+      if (segSel) {
+        // A saved cap that is not one of the preset sizes (an older build, or a
+        // value typed into storage) still has to show up in the select.
+        var segCap = (settings.batch && settings.batch.maxSegmentsPerBatch) ||
+          ns.constants.BATCH_SETTINGS.maxSegmentsPerBatch;
+        var preset = Array.prototype.some.call(segSel.options, function (o) { return o.value === String(segCap); });
+        if (!preset) {
+          var extra = document.createElement('option');
+          extra.value = String(segCap);
+          extra.textContent = String(segCap) + ' (saved)';
+          segSel.appendChild(extra);
+        }
+        segSel.value = String(segCap);
+      }
       render();
     }).catch(function (err) {
       lastError = 'settings could not be loaded: ' + String((err && err.message) || err);
@@ -119,11 +138,11 @@
           renderStatus('error');
           return;
         }
-        counts = { segments: res.total, translated: res.translated, failed: res.failed };
+        counts = { segments: res.total, translated: res.translated, failed: res.failed, requests: res.requests || 0 };
         var applied = (res.applied != null) ? res.applied : res.translated;
         var label = res.failed
           ? ('failed ' + res.failed + ' / ' + res.total)
-          : ('applied ' + applied + ' / ' + res.total);
+          : ('applied ' + applied + ' / ' + res.total + (res.requests != null ? ' (' + res.requests + ' request(s))' : ''));
         if (res.errorCounts && Object.keys(res.errorCounts).length) {
           lastError = 'errors: ' + Object.keys(res.errorCounts).map(function (k) {
             return k + '×' + res.errorCounts[k];
@@ -167,7 +186,7 @@
             renderStatus('error');
             return;
           }
-          counts = { segments: 0, translated: 0, failed: 0 };
+          counts = { segments: 0, translated: 0, failed: 0, requests: 0 };
           var still = (res.translated != null) ? res.translated : 0;
           renderStatus('restored ' + (res.restored || 0) + ' text node(s)' + (still ? ' (' + still + ' still translated)' : ''));
         }).catch(function (err) {
@@ -189,6 +208,25 @@
       settings.maxConcurrent = clampConcurrent($('concurrency').value);
       saveSettings({ maxConcurrent: settings.maxConcurrent });
     });
+
+    // Packing settings are read by the content script when a run starts, so a
+    // change here applies to the next "Translate Page" press.
+    var strategySel = $('strategy');
+    if (strategySel) {
+      strategySel.addEventListener('change', function () {
+        settings.request = Object.assign({}, settings.request, { strategy: clampStrategy($('strategy').value) });
+        saveSettings({ request: settings.request });
+      });
+    }
+    var segmentsSel = $('segments');
+    if (segmentsSel) {
+      segmentsSel.addEventListener('change', function () {
+        var n = parseInt($('segments').value, 10);
+        if (!isFinite(n) || n < 1) return;
+        settings.batch = Object.assign({}, settings.batch, { maxSegmentsPerBatch: n });
+        saveSettings({ batch: settings.batch });
+      });
+    }
   }
 
   document.addEventListener('DOMContentLoaded', init);

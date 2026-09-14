@@ -43,8 +43,30 @@
       </select>
     </label>
 
+    <label class="row">
+      <span>Segments per request</span>
+      <select id="segments">
+        <option value="1">1 (one request each)</option>
+        <option value="8">8</option>
+        <option value="16">16</option>
+        <option value="32">32</option>
+        <option value="48">48</option>
+        <option value="64">64</option>
+        <option value="96">96</option>
+      </select>
+    </label>
+
+    <label class="row">
+      <span>Request packing</span>
+      <select id="strategy">
+        <option value="multi">multi (one request per batch)</option>
+        <option value="single">single (one request per text node)</option>
+      </select>
+    </label>
+
     <section class="stats">
       <div class="stat"><span class="label">segments</span><span id="segCount" class="value">0</span></div>
+      <div class="stat"><span class="label">requests</span><span id="reqCount" class="value">0</span></div>
       <div class="stat"><span class="label">translated</span><span id="transCount" class="value">0</span></div>
       <div class="stat"><span class="label">failed</span><span id="failCount" class="value">0</span></div>
     </section>
@@ -54,7 +76,8 @@
     <details class="debug">
       <summary>Debug (console)</summary>
       <p class="hint">On the page (F12 &rarr; Console), filter by <code>[PLaMoTranslate]</code> and run:</p>
-      <pre class="hint">__plamo.getState()        // counters of the last run
+      <pre class="hint">__plamo.getState()        // counters of the last run (incl. requests used)
+__plamo.getBatchPlan()      // how the next run packs segments into API requests
 __plamo.getApplied()      // text nodes rewritten so far (original &rarr; Japanese)
 __plamo.dumpLogs()        // last log records, including trace level
 __plamo.backgroundLogs()  // the worker's own logs, printed here

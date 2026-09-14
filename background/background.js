@@ -3,9 +3,11 @@
 // logger, constants, messaging, api/profiles, api/openai-client, scheduler.
 //
 // Centralizes ALL API access so the page never talks to the API directly
-// (keeps page secrets out of the request body). Translates a batch of
-// segments in parallel, bounded by concurrency, with per-request timeout,
-// error classification, and per-segment isolation.
+// (keeps page secrets out of the request body). One batch = ONE request: every
+// segment of a batch is one line of one prompt and the answer is split back by
+// lines. Requests run in parallel, bounded by concurrency (which now limits
+// requests, not segments), with per-request timeout, error classification, and
+// per-segment isolation.
 //
 // MV3 allows only one service-worker entry file. The shared modules needed by
 // the background are loaded here into the same global scope via importScripts
@@ -93,6 +95,12 @@ importScripts(
   // Translates one batch. Never rejects: every per-segment problem becomes an
   // { error, errorType } entry plus its own log line, so a failing batch tells
   // us what actually went wrong instead of only "something failed".
+  //
+  // A batch is ONE API request now: translateSegments() puts every segment of
+  // the batch on its own line of one prompt and the answer is split back by
+  // lines. The semaphore therefore limits *requests* instead of segments, which
+  // is the whole speed-up: a request costs a fixed prompt+decode round trip, so
+  // 300 segments used to be 300 of them and are now a handful.
   async function translateBatch(batch, opts) {
     opts = opts || {};
     var requestId = opts.requestId || '-';
@@ -112,89 +120,214 @@ importScripts(
     }
 
     var profile = profiles.getProfile(opts.profileName);
-    var timeoutMs = (typeof opts.timeoutMs === 'number' && opts.timeoutMs > 0) ? opts.timeoutMs : C.DEFAULT_TIMEOUT_MS;
-    var guardMs = timeoutMs + 5000; // the client aborts at timeoutMs; this only fires if it never returns
+    var R = Object.assign({}, C.REQUEST_SETTINGS, opts.request || {});
+    var strategy = (C.REQUEST_STRATEGIES.indexOf(opts.strategy) !== -1) ? opts.strategy : (R.strategy || C.REQUEST_SETTINGS.strategy);
+    var explicitTimeout = (typeof opts.timeoutMs === 'number' && opts.timeoutMs > 0);
+    var timeoutMs = explicitTimeout ? opts.timeoutMs : C.DEFAULT_TIMEOUT_MS;
+    var batchTokens = (typeof batch.estimatedTokens === 'number') ? batch.estimatedTokens : 0;
+    // A batched request answers many segments at once, so it gets its own,
+    // longer timeout that grows with the amount of text in it.
+    var batchTimeoutMs = explicitTimeout ? opts.timeoutMs
+      : Math.round((R.timeoutBaseMs || C.DEFAULT_TIMEOUT_MS) + batchTokens * (R.timeoutPerTokenMs || 0));
+    var guardMs = timeoutMs + 5000;        // the client aborts at timeoutMs; this only fires if it never returns
+    var batchGuardMs = batchTimeoutMs + 5000;
     var cache = messaging.normalizeCache(opts.cache);
     var conc = applyConcurrency(opts.concurrency, tag);
 
     log.debug(tag + ' start ' + messaging.summarizeBatch(batch) + ' | ' + profiles.describeProfile(profile) +
-      ' | POST ' + profiles.resolveEndpointUrl(profile) + ' | timeout=' + timeoutMs + 'ms' +
+      ' | POST ' + profiles.resolveEndpointUrl(profile) + ' | strategy=' + strategy +
+      ' | timeout=' + timeoutMs + 'ms batchTimeout=' + batchTimeoutMs + 'ms' +
       ' | cache=' + cache.form + '(' + cache.size + ')' + ' | limit=' + conc.limit +
       ' active=' + conc.active + ' pending=' + conc.pending);
 
     var t0 = performance.now();
     var results = {};
-    var translated = 0, failed = 0, cacheHits = 0, firstSuccessLogged = false;
+    var requests = 0;
+    var firstSuccessLogged = false;
+    // Alignment bookkeeping: 'aligned' is the happy path, 'fallback' counts the
+    // segments that had to be redone one by one.
+    var align = { requests: 0, aligned: 0, retried: 0, mismatch: 0, fallback: 0 };
 
-    var tasks = batch.segments.map(function (segment) {
-      return semaphore.run(function () {
-        return new Promise(function (resolve) {
-          var text = String(segment.text == null ? '' : segment.text);
-          var preview = JSON.stringify(text.slice(0, 60));
-
-          if (cache.has(segment.text)) {
-            var cached = cache.get(segment.text);
-            if (typeof cached === 'string' && cached.length) {
-              cacheHits++; translated++;
-              results[segment.id] = { id: segment.id, text: segment.text, translatedText: cached, cached: true };
-              log.trace(tag + ' seg#' + segment.id + ' cache-hit chars=' + cached.length);
-              resolve();
-              return;
-            }
-            log.warn(tag + ' seg#' + segment.id + ' cache entry is not a usable string (' + typeof cached + '); calling the API');
-          }
-
-          var done = false;
-          var segT0 = performance.now();
-          var guard = setTimeout(function () {
-            if (done) return;
-            done = true;
-            failed++;
-            results[segment.id] = { id: segment.id, text: segment.text, error: 'no result within ' + guardMs + 'ms', errorType: 'timeout' };
-            log.warn(tag + ' seg#' + segment.id + ' GUARD TIMEOUT after ' + guardMs + 'ms text=' + preview);
-            resolve();
-          }, guardMs);
-
-          state.requests++;
-          translateSegment(profile, segment, { timeoutMs: timeoutMs }).then(function (res) {
-            if (done) return;
-            done = true;
-            clearTimeout(guard);
-            var ms = Math.round(performance.now() - segT0);
-            if (res && res.translatedText) {
-              translated++;
-              results[segment.id] = { id: segment.id, text: segment.text, translatedText: res.translatedText };
-              if (!firstSuccessLogged) {
-                firstSuccessLogged = true;
-                log.debug(tag + ' first success seg#' + segment.id + ' ' + ms + 'ms chars=' + String(res.translatedText).length +
-                  ' -> ' + JSON.stringify(String(res.translatedText).slice(0, 40)));
-              }
-              log.trace(tag + ' seg#' + segment.id + ' ok ' + ms + 'ms in=' + text.length + ' out=' + String(res.translatedText).length);
-            } else {
-              failed++;
-              var errorType = (res && res.errorType) || 'unknown';
-              var errorMessage = (res && res.error) || 'client reported no error and no text';
-              results[segment.id] = { id: segment.id, text: segment.text, error: errorMessage, errorType: errorType };
-              log.warn(tag + ' seg#' + segment.id + ' FAILED ' + errorType + ' ' + ms + 'ms :: ' +
-                String(errorMessage).slice(0, 200) + ' :: text=' + preview);
-            }
-            resolve();
-          }).catch(function (err) {
-            if (done) return;
-            done = true;
-            clearTimeout(guard);
-            failed++;
-            var message = String((err && err.message) || err);
-            results[segment.id] = { id: segment.id, text: segment.text, error: message, errorType: 'internal' };
-            log.error(tag + ' seg#' + segment.id + ' THREW ' + message +
-              ' stack=' + String((err && err.stack) || '').split('\n').slice(0, 3).join(' | '));
-            resolve();
-          });
+    // Resolves to { timedOut, value, error }: the client never rejects, but a
+    // fetch that never comes back must not hold the message port open forever.
+    function guarded(ms, onTrip, promise) {
+      return new Promise(function (resolve) {
+        var settled = false;
+        var timer = setTimeout(function () {
+          if (settled) return;
+          settled = true;
+          onTrip();
+          resolve({ timedOut: true });
+        }, ms);
+        promise.then(function (value) {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          resolve({ timedOut: false, value: value });
+        }, function (error) {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          resolve({ timedOut: false, error: error });
         });
       });
+    }
+
+    function markFailed(segments, message, errorType) {
+      segments.forEach(function (segment) {
+        results[segment.id] = { id: segment.id, text: segment.text, error: message, errorType: errorType };
+      });
+    }
+
+    // One request carrying the whole batch. A batch answer whose line count does
+    // not match is retried once with numbers; whatever is still unplaced keeps an
+    // errorType 'align' entry, which is what the per-segment fallback picks up.
+    async function batchRequest(segments) {
+      var formats = [R.format === 'numbered' ? 'numbered' : 'line'];
+      if (R.retryWithNumbers && formats[0] !== 'numbered') formats.push('numbered');
+      var textById = {};
+      segments.forEach(function (segment) { textById[segment.id] = segment.text; });
+
+      for (var f = 0; f < formats.length; f++) {
+        var format = formats[f];
+        if (f > 0) {
+          align.retried++;
+          log.warn(tag + ' line count did not match, retrying the batch with numbered lines');
+        }
+        requests++; align.requests++; state.requests++;
+        var reqT0 = performance.now();
+        var out = await guarded(batchGuardMs, function () {
+          log.warn(tag + ' BATCH GUARD TIMEOUT after ' + batchGuardMs + 'ms segments=' + segments.length);
+        }, ns.openaiClient.translateSegments(profile, segments, {
+          timeoutMs: batchTimeoutMs,
+          format: format,
+          systemPrompt: R.batchSystemPrompt || undefined,
+          maxTokens: R.maxTokensPerRequest || undefined
+        }));
+        var ms = Math.round(performance.now() - reqT0);
+
+        if (out.timedOut) {
+          markFailed(segments, 'no result within ' + batchGuardMs + 'ms', 'timeout');
+          return 'timeout';
+        }
+        if (out.error) {
+          var thrown = String((out.error && out.error.message) || out.error);
+          markFailed(segments, thrown, 'internal');
+          log.error(tag + ' BATCH THREW ' + thrown +
+            ' stack=' + String((out.error && out.error.stack) || '').split('\n').slice(0, 3).join(' | '));
+          return 'internal';
+        }
+
+        var res = out.value;
+        if (res.status === 'error') {
+          // A transport failure says nothing about the line count, and repeating
+          // it once per segment would only hammer a server that is already down.
+          markFailed(segments, res.error || 'request failed', res.errorType || 'unknown');
+          log.warn(tag + ' BATCH FAILED ' + (res.errorType || 'unknown') + ' ' + ms + 'ms segments=' + res.sent +
+            ' :: ' + String(res.error || '').slice(0, 200));
+          return 'error';
+        }
+        Object.keys(res.results).forEach(function (id) {
+          results[id] = Object.assign({ text: textById[id] }, res.results[id]);
+        });
+        if (res.status === 'aligned') {
+          align.aligned++;
+          log.debug(tag + ' BATCH OK segments=' + res.sent + ' lines=' + res.got + ' format=' + format +
+            ' ' + ms + 'ms in=' + res.inChars + ' out=' + res.outChars + (res.usedNumbers ? ' numbered' : ''));
+          return 'aligned';
+        }
+        log.warn(tag + ' BATCH MISMATCH segments=' + res.sent + ' lines=' + res.got + ' format=' + format + ' ' + ms + 'ms');
+      }
+      align.mismatch++;
+      return 'mismatch';
+    }
+
+    // One request, one segment: used for a batch of one, for strategy 'single',
+    // and for the segments a batched answer could not be split back for.
+    function segmentRequest(segment) {
+      var preview = JSON.stringify(String(segment.text == null ? '' : segment.text).slice(0, 60));
+      var t1 = performance.now();
+      requests++; state.requests++;
+      return guarded(guardMs, function () {
+        results[segment.id] = { id: segment.id, text: segment.text, error: 'no result within ' + guardMs + 'ms', errorType: 'timeout' };
+        log.warn(tag + ' seg#' + segment.id + ' GUARD TIMEOUT after ' + guardMs + 'ms text=' + preview);
+      }, translateSegment(profile, segment, { timeoutMs: timeoutMs })).then(function (out) {
+        if (out.timedOut) return;
+        var ms = Math.round(performance.now() - t1);
+        if (out.error) {
+          var thrown = String((out.error && out.error.message) || out.error);
+          results[segment.id] = { id: segment.id, text: segment.text, error: thrown, errorType: 'internal' };
+          log.error(tag + ' seg#' + segment.id + ' THREW ' + thrown +
+            ' stack=' + String((out.error && out.error.stack) || '').split('\n').slice(0, 3).join(' | '));
+          return;
+        }
+        var res = out.value;
+        if (res && res.translatedText) {
+          results[segment.id] = { id: segment.id, text: segment.text, translatedText: res.translatedText };
+          if (!firstSuccessLogged) {
+            firstSuccessLogged = true;
+            log.debug(tag + ' first success seg#' + segment.id + ' ' + ms + 'ms chars=' + String(res.translatedText).length +
+              ' -> ' + JSON.stringify(String(res.translatedText).slice(0, 40)));
+          }
+          log.trace(tag + ' seg#' + segment.id + ' ok ' + ms + 'ms in=' + String(segment.text == null ? '' : segment.text).length +
+            ' out=' + String(res.translatedText).length);
+        } else {
+          var errorType = (res && res.errorType) || 'unknown';
+          var errorMessage = (res && res.error) || 'client reported no error and no text';
+          results[segment.id] = { id: segment.id, text: segment.text, error: errorMessage, errorType: errorType };
+          log.warn(tag + ' seg#' + segment.id + ' FAILED ' + errorType + ' ' + ms + 'ms :: ' +
+            String(errorMessage).slice(0, 200) + ' :: text=' + preview);
+        }
+      });
+    }
+
+    // Cache hits never reach the API, so they are taken out before packing.
+    var pending = [];
+    batch.segments.forEach(function (segment) {
+      if (!cache.has(segment.text)) { pending.push(segment); return; }
+      var cached = cache.get(segment.text);
+      if (typeof cached === 'string' && cached.length) {
+        results[segment.id] = { id: segment.id, text: segment.text, translatedText: cached, cached: true };
+        log.trace(tag + ' seg#' + segment.id + ' cache-hit chars=' + cached.length);
+        return;
+      }
+      log.warn(tag + ' seg#' + segment.id + ' cache entry is not a usable string (' + typeof cached + '); calling the API');
+      pending.push(segment);
     });
 
-    await Promise.all(tasks);
+    if (pending.length) {
+      if (strategy !== 'single' && pending.length > 1) {
+        // One limiter slot for the whole batch: a slot is a request now.
+        await semaphore.run(function () { return batchRequest(pending); });
+        var unplaced = pending.filter(function (segment) {
+          var r = results[segment.id];
+          return !r || r.errorType === 'align';
+        });
+        if (unplaced.length && R.perSegmentFallback) {
+          align.fallback = unplaced.length;
+          log.warn(tag + ' ' + unplaced.length + ' of ' + pending.length + ' segment(s) fall back to one request each');
+          await Promise.all(unplaced.map(function (segment) {
+            return semaphore.run(function () { return segmentRequest(segment); });
+          }));
+        }
+      } else {
+        await Promise.all(pending.map(function (segment) {
+          return semaphore.run(function () { return segmentRequest(segment); });
+        }));
+      }
+    }
+
+    // Counters are derived from the results, so a segment that failed in the
+    // batched pass and then succeeded in the fallback pass is counted once.
+    var translated = 0, failed = 0, cacheHits = 0;
+    batch.segments.forEach(function (segment) {
+      var r = results[segment.id];
+      if (!r) return;
+      if (r.error) failed++;
+      else if (r.translatedText) translated++;
+      if (r.cached) cacheHits++;
+    });
+
     var elapsedMs = Math.round(performance.now() - t0);
     var status = failed === 0 ? 'success' : (translated === 0 ? 'failure' : 'partial');
     var summary = messaging.summarizeResults(results);
@@ -206,6 +339,9 @@ importScripts(
       endpoint: endpoint,
       segments: segCount,
       estimatedTokens: batch.estimatedTokens,
+      strategy: strategy,
+      requests: requests, // how many HTTP POSTs this batch cost — the number to watch
+      align: align,
       elapsedMs: elapsedMs,
       results: results,
       translated: translated,
@@ -219,10 +355,19 @@ importScripts(
     state.failed += failed;
     state.cacheHits += cacheHits;
     var doneLine = tag + ' done ' + status.toUpperCase() + ' ' + summary.text +
+      ' requests=' + requests + ' strategy=' + strategy +
       ' cache=' + cache.hits + 'hit/' + cache.misses + 'miss in ' + elapsedMs + 'ms';
     if (status === 'success') log.debug(doneLine); else log.warn(doneLine);
+    // One machine-readable record per batch: the segments/requests ratio is what
+    // shows whether the packing is doing its job (grep the log for "batch").
+    log.batch({
+      request: requestId, server: profile.name, strategy: strategy, requests: requests,
+      segments: segCount, units: batch.units, estimatedTokens: batch.estimatedTokens,
+      align: align, cacheHits: cacheHits, elapsedMs: elapsedMs, status: status
+    });
     state.recentBatches.push({
-      requestId: requestId, at: Date.now(), status: status, segments: segCount,
+      requestId: requestId, at: Date.now(), status: status, segments: segCount, units: batch.units,
+      requests: requests, strategy: strategy,
       translated: translated, failed: failed, cacheHits: cacheHits, elapsedMs: elapsedMs,
       profile: profile.name, endpoint: endpoint, outcome: summary.text
     });
@@ -259,6 +404,8 @@ importScripts(
           profileName: msg.profileName || msg.profile,
           concurrency: msg.concurrency,
           timeoutMs: msg.timeoutMs,
+          strategy: msg.strategy,
+          request: msg.request,
           cache: msg.cache,
           rawSummary: messaging.summarizeMessage(msg)
         }));

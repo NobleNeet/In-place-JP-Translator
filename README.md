@@ -8,7 +8,9 @@ The focus of this project is **efficient use of the local LLM and fast page
 translation**, not translation quality per se.
 
 - English text is extracted as readable blocks (not one text node at a time),
-  grouped into batches, and sent to the API **in parallel**.
+  packed into batches and sent to the API **in parallel**. By default one batch
+  is **one API request** carrying many text nodes, one node per line, so a page
+  costs a handful of requests instead of hundreds.
 - Currently visible content is translated first (viewport priority), and
   completed batches are applied to the DOM as they finish.
 - All network access is centralized in the background service worker; content
@@ -26,14 +28,14 @@ plamo-page-translator/
 ├── content/
 │   ├── content.js           # orchestrator: extract -> segment -> batch -> apply
 │   ├── extractor.js         # collects translatable *text nodes* (never elements)
-│   ├── segmenter.js         # one segment per text node, language heuristic, tokens, priority
+│   ├── segmenter.js         # one segment per text node, language heuristic, block keys, tokens, priority
 │   └── renderer.js          # writes nodeValue only, registry for restore
 ├── api/
 │   ├── profiles.js          # API profiles (endpoints, model, apiKey)
 │   └── openai-client.js     # OpenAI-compatible client (swap-able later)
 ├── translation/
 │   ├── queue.js             # ordered queue
-│   ├── batcher.js           # bounded batch creation
+│   ├── batcher.js           # packs DOM blocks into API requests (count + token caps)
 │   ├── scheduler.js         # concurrency semaphore
 │   └── cache.js             # session in-memory cache
 ├── shared/
@@ -104,8 +106,8 @@ Every request is logged as
 `request <profile> POST <resolved url> model=... kind=... chars=...`, so a wrong
 URL is visible immediately in the console.
 
-Settings you change in the popup (profile, mode, concurrency) are persisted in
-`chrome.storage.local`.
+Settings you change in the popup (profile, mode, concurrency, segments per
+request, request packing) are persisted in `chrome.storage.local`.
 
 ---
 
@@ -149,14 +151,20 @@ Open **DevTools → Console** on the page. All diagnostics are prefixed with
 Per-batch metric (printed as one line):
 
 ```
-[PLaMoTranslate] {"batch":12,"server":"evo-x2-plamo2","segments":16,"estimatedTokens":2840,"elapsedMs":1843,"status":"success"}
+[PLaMoTranslate] {"request":"r1b12","server":"evo-x2-plamo2","strategy":"multi","requests":1,"segments":16,"units":9,"estimatedTokens":2840,"align":{"requests":1,"aligned":1,"retried":0,"mismatch":0,"fallback":0},"cacheHits":0,"elapsedMs":1843,"status":"success"}
 ```
 
-Start / completion summary:
+`requests` is how many HTTP POSTs that batch cost (1 when the line-structured
+answer came back aligned), `units` how many DOM blocks were packed into it, and
+`align` what the answer did: `aligned` first try, `retried` (numbered format),
+`mismatch` (gave up on batching for that batch) and `fallback` segments that
+were re-requested one by one.
+
+Start / completion summary from the content script:
 
 ```
-[PLaMoTranslate] start: 412 segments in 27 batch(es)
-[PLaMoTranslate] done { total: 412, translated: 410, failed: 2, cacheHits: 3, elapsedMs: 9821, firstTranslatedLatencyMs: 612, firstViewportLatencyMs: 612 }
+[PLaMoTranslate] packing segments=412 blocks=268 requests=14 caps=48seg/3000tok first=10 strategy=multi (segments/request=29.4)
+[PLaMoTranslate] done total=412 translated=410 applied=410 failed=2 skipped=0 cacheHits=3 requests=16 (14 request(s) for 412 segment(s)) in 9821ms firstTranslated=612ms cache=409
 ```
 
 You can also inspect live state from the console:
@@ -169,6 +177,8 @@ window.__plamo.scanStats()     // elements walked, skipped subtrees, refused tex
 window.__plamo.restoreText(n)  // put one text node back (n from getApplied/getPending)
 window.__plamo.getCache()      // SessionCache { map, hits, misses }
 window.__plamo.getSettings()   // current settings
+window.__plamo.getBatchPlan()  // how the next run would be packed: { segments, blocks, requests, segmentsPerRequest, caps, strategy, batches }
+window.__plamo.getBatcherCaps()// the caps the packer in use was built with (proves a saved setting landed)
 ```
 
 ---
@@ -178,8 +188,8 @@ window.__plamo.getSettings()   // current settings
 No test framework and no dependencies; both suites run on plain Node:
 
 ```
-node test/logic.test.cjs   # queue, batcher, scheduler, cache, background, messaging
-node test/dom.test.cjs     # extractor + segmenter + renderer on a small fake DOM
+node test/logic.test.cjs   # queue, batcher/packer, scheduler, cache, batch request + line alignment, background, messaging
+node test/dom.test.cjs     # extractor + segmenter + renderer + packer on a small fake DOM
 ```
 
 `test/dom.test.cjs` builds a page containing the structures that used to break
@@ -192,19 +202,44 @@ subtrees, `contenteditable`, SVG) and then checks that translating it
 * does not change the DOM **shape** (tags, attributes, number and position of
   text nodes) — only `Text.nodeValue` changes;
 * can put every value back with `restore()` / `restoreAll()`, without leaving
-  any bookkeeping attribute behind.
+  any bookkeeping attribute behind;
+* keeps the fragments of one paragraph (text around an inline link) and the
+  items of one list in a single API request — the block/container keys the
+  segmenter assigns survive all the way into the packer.
 
 Each suite prints one line per assertion and a final `RESULT: n passed, m failed`;
 it exits non-zero when `m` is not 0.
 
 ---
 
-## Concurrency setting
+## Concurrency and batching settings
 
-Change it in the popup: **1 / 2 / 4 / 8** concurrent requests to the API.
-Default is **2**. This is enforced by a semaphore
-(`translation/scheduler.js`) so in-flight requests never exceed the limit.
-Phase 5 compares these values against each other.
+All of these are in the popup and apply to the **next** "Translate Page" press.
+
+- **Concurrent requests** (1 / 2 / 4 / 8, default 2): how many requests may be
+  in flight at once, enforced by a semaphore (`translation/scheduler.js`). With
+  multi-segment packing a slot is a whole *request*, so this limits requests,
+  not text nodes.
+- **Segments per request** (default 48): how many text nodes one request
+  carries. A batch is also capped by estimated tokens (3000), so long prose
+  produces smaller batches on its own. The **first** batch is deliberately
+  smaller (`firstBatchMaxSegments`, default 10) so the visible area is not held
+  up behind one big request.
+- **Request packing**: `multi` (default — one request per batch, one text node
+  per line) or `single` (one request per text node, i.e. the previous
+  behaviour, kept for A/B comparison).
+
+Packing never cuts a block in half: the fragments of one `<p>` (text around an
+inline `<a>` or `<strong>`) and the items of one menu or list always stay in the
+same request, because a partial block would come back as a partial translation.
+
+A batched answer is mapped back to text nodes by **line count**. If the model
+answers with a different number of lines than we sent segments, nothing is
+placed — a translation in the wrong text node is worse than none — the batch is
+retried once with numbered lines, and whatever still cannot be placed is
+requested again one segment per request. Watch `align=` in the per-batch log to
+see how often that happens; `__plamo.getBatchPlan()` tells you what a run would
+cost before you start it.
 
 ---
 
@@ -219,7 +254,11 @@ Phase 5 compares these values against each other.
 - [x] Language heuristic (skips obvious non-English)
 - [x] Loose token estimation (separated function)
 - [x] Viewport priority (visible → near → rest)
-- [x] Bounded batching (count + estimated tokens)
+- [x] Bounded batching (count + estimated tokens) with block-aware packing
+- [x] Multi-segment-per-request batching: one request carries a whole batch
+      (one text node per line), mapped back by line count
+- [x] Alignment safety: numbered retry, then per-segment fallback, never a
+      guessed line placement
 - [x] Bounded concurrency (1/2/4/8) with semaphore
 - [x] 120s timeout + AbortController
 - [x] Per-segment error isolation (one batch failing doesn't stop the rest)
@@ -235,7 +274,11 @@ Phase 5 compares these values against each other.
 - [ ] Persistent cache
 - [ ] Auto-translate on load / per-domain allowlist
 - [ ] Rendering modes (translation only / original only / both)
-- [ ] Multi-segment-per-request batching (continuous batching)
+- [ ] Server-side batching (`/v1/completions` with a `prompt` array, llama.cpp
+      batch endpoint, or a native batch endpoint) instead of one line-separated
+      prompt
+- [ ] Per-profile batch prompt / system prompt, so a model that insists on a
+      different answer format can be pinned to it per server
 
 ---
 

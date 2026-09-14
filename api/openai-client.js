@@ -39,9 +39,12 @@
   // PLaMo 2 Translate is a translation model: while systemPrompt is empty the
   // raw English text is sent as the only message. A system message is added
   // only when the profile actually asks for one.
-  function buildMessages(profile, text) {
+  function buildMessages(profile, text, opts) {
+    opts = opts || {};
     var messages = [];
-    var systemPrompt = profile && profile.systemPrompt;
+    // opts.systemPrompt lets a multi-segment request carry its own instruction
+    // without changing what the profile sends for a single segment.
+    var systemPrompt = firstDefined(opts.systemPrompt, profile && profile.systemPrompt);
     if (systemPrompt) messages.push({ role: 'system', content: systemPrompt });
     messages.push({ role: 'user', content: text });
     return messages;
@@ -59,7 +62,7 @@
     var stop = firstDefined(opts.stop, profile.stop);
     if (stop) body.stop = stop;
     if (kind === COMPLETIONS_ENDPOINT) body.prompt = text;
-    else body.messages = buildMessages(profile, text);
+    else body.messages = buildMessages(profile, text, opts);
     return body;
   }
 
@@ -176,10 +179,141 @@
     });
   }
 
+  // --- multi-segment requests -------------------------------------------------
+  // One request carries a whole batch: every segment becomes ONE line of the
+  // prompt and the answer is read back line by line. Segments come from the
+  // segmenter with all runs of whitespace collapsed, so a segment never contains
+  // a newline — that is what makes the line count usable as a protocol even for
+  // a translation model that is sent no instruction at all.
+  function toPromptLine(segment, index, format) {
+    var text = String((segment && segment.text != null) ? segment.text : '').replace(/\s+/g, ' ').trim();
+    return format === 'numbered' ? (String(index + 1) + '. ' + text) : text;
+  }
+
+  function buildBatchPrompt(segments, opts) {
+    opts = opts || {};
+    var format = opts.format || 'line';
+    var lines = (segments || []).map(function (s, i) { return toPromptLine(s, i, format); });
+    var text = lines.join('\n');
+    return { text: text, format: format, lines: lines.length, chars: text.length };
+  }
+
+  // A model that wraps its answer in a code fence is unwrapped here, but the
+  // newlines inside the fence are kept: they ARE the batch.
+  function unwrapFence(text) {
+    var t = String(text == null ? '' : text).replace(/\r\n?/g, '\n');
+    var lines = t.split('\n');
+    while (lines.length > 0 && /^\s*```/.test(lines[0])) lines.shift();
+    while (lines.length > 0 && /^\s*```[^`]*$/.test(lines[lines.length - 1])) lines.pop();
+    return lines.join('\n');
+  }
+
+  var LINE_NUMBER_RE = /^\s*(\d{1,4})\s*[.)\]]\s+/;
+
+  function leadingNumbers(lines) {
+    return lines.map(function (l) {
+      var m = LINE_NUMBER_RE.exec(l);
+      return m ? parseInt(m[1], 10) : 0;
+    });
+  }
+
+  // Splits an answer back into one line per segment.
+  // -> { lines, status: 'aligned'|'mismatch', got, usedNumbers }
+  function splitBatchOutput(out, count, opts) {
+    opts = opts || {};
+    var lines = unwrapFence(out).split(/\n+/)
+      .map(function (l) { return l.replace(/\s+/g, ' ').trim(); })
+      .filter(function (l) { return l.length > 0; });
+    if (!lines.length) return { lines: [], status: 'mismatch', got: 0, usedNumbers: false };
+
+    var numbers = leadingNumbers(lines);
+    var allNumbered = lines.length > 1 && numbers.every(function (n) { return n > 0; });
+    // The answer kept our numbering (or invented its own): trust the numbers.
+    // They survive a reordering and they show which segment is missing, so a
+    // batch that is numbered and complete is still applied line by line.
+    if (allNumbered && lines.length >= count) {
+      var slots = new Array(count).fill(null);
+      var seen = {};
+      var usable = true;
+      lines.forEach(function (line, i) {
+        var n = numbers[i];
+        if (n < 1 || n > count || seen[n]) { usable = false; return; }
+        seen[n] = true;
+        slots[n - 1] = line.replace(LINE_NUMBER_RE, '').trim();
+      });
+      if (usable && slots.every(function (s) { return typeof s === 'string' && s.length > 0; })) {
+        return { lines: slots, status: 'aligned', got: lines.length, usedNumbers: true };
+      }
+    }
+
+    if (lines.length === count) {
+      return {
+        lines: lines.map(function (l) { return allNumbered ? l.replace(LINE_NUMBER_RE, '').trim() : l; }),
+        status: 'aligned', got: lines.length, usedNumbers: false
+      };
+    }
+    // More or fewer lines than segments: guessing which line belongs to which
+    // text node is how text ends up in the wrong place, so this is reported as a
+    // mismatch and the caller retries (or falls back to one request per segment).
+    return { lines: lines, status: 'mismatch', got: lines.length, usedNumbers: false };
+  }
+
+  // One request for many segments. Never rejects: a transport failure is
+  // reported once and copied onto every segment of the batch by the caller.
+  // -> { status: 'aligned'|'mismatch'|'error'|'empty', results: { id: result }, sent, got }
+  function translateSegments(profile, segments, opts) {
+    opts = opts || {};
+    var list = segments || [];
+    if (!list.length) return Promise.resolve({ status: 'empty', results: {}, sent: 0, got: 0 });
+
+    var built = buildBatchPrompt(list, { format: opts.format });
+    var reqOpts = Object.assign({}, opts, {
+      systemPrompt: firstDefined(opts.systemPrompt, profile && profile.batchSystemPrompt)
+    });
+    var t0 = nowMs();
+    log.debug('request ' + profile.name + ' batch segments=' + list.length +
+      ' format=' + built.format + ' chars=' + built.chars);
+
+    return requestCompletion(profile, built.text, reqOpts).then(function (res) {
+      var elapsedMs = Math.round(nowMs() - t0);
+      if (res.error) {
+        return {
+          status: 'error', errorType: res.errorType, error: res.error, results: {},
+          sent: list.length, got: 0, elapsedMs: elapsedMs, inChars: built.chars
+        };
+      }
+      var split = splitBatchOutput(res.translatedText, list.length, { format: built.format });
+      var results = {};
+      // On a mismatch NO line is placed: a wrong translation in the wrong text
+      // node is worse than none, and the retry / per-segment fallback below can
+      // only re-request what we left unplaced here.
+      var place = split.status !== 'mismatch';
+      list.forEach(function (seg, i) {
+        var line = place ? split.lines[i] : null;
+        if (line) results[seg.id] = { id: seg.id, translatedText: line };
+        else {
+          results[seg.id] = {
+            id: seg.id, errorType: 'align',
+            error: 'batch answer had ' + split.got + ' line(s) for ' + list.length + ' segment(s)'
+          };
+        }
+      });
+      return {
+        status: split.status, results: results, sent: list.length, got: split.got,
+        usedNumbers: split.usedNumbers, elapsedMs: elapsedMs, inChars: built.chars,
+        outChars: String(res.translatedText == null ? '' : res.translatedText).length
+      };
+    });
+  }
+
   ns.openaiClient = {
     requestCompletion: requestCompletion,
     requestChatCompletions: requestCompletion, // previous name, kept as an alias
     translateSegment: translateSegment,
+    translateSegments: translateSegments,
+    buildBatchPrompt: buildBatchPrompt,
+    splitBatchOutput: splitBatchOutput,
+    unwrapFence: unwrapFence,
     endpointKind: endpointKind,
     buildMessages: buildMessages,
     buildRequestBody: buildRequestBody,

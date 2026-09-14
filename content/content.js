@@ -4,11 +4,14 @@
 // extractor, segmenter, renderer, batcher, cache, queue.
 //
 // Flow: collect TEXT NODES -> one segment per text node -> order by viewport
-// priority -> batch -> send each batch to the background (in parallel,
-// concurrency bound) -> write each finished translation into its own text node
-// (node.nodeValue only) as soon as its batch arrives. Because an element's
-// children are never replaced, links/forms/images survive and the layout holds.
-// MSG_RESTORE (or __plamo.restoreAll()) puts the original values back.
+// priority -> pack the segments into batches, where one batch is ONE API
+// request (paragraph fragments stay together, menu/list items are piled into
+// the same request) -> send each batch to the background (in parallel,
+// concurrency bound = requests in flight) -> write each finished translation
+// into its own text node (node.nodeValue only) as soon as its batch arrives.
+// Because an element's children are never replaced, links/forms/images survive
+// and the layout holds. MSG_RESTORE (or __plamo.restoreAll()) puts the original
+// values back.
 (function () {
   var ns = globalThis.__PLAMO__;
 
@@ -39,7 +42,21 @@
   var translateSegment = ns.openaiClient.translateSegment;
 
   var settings = {};
-  var batcher = createBatcher(settings.batch || {});
+  // The batcher holds the caps from settings.batch, so it is created from the
+  // defaults here and RE-created once loadSettings() has answered — a batcher
+  // built once at load time would silently keep the defaults and ignore a saved
+  // "segments per request". batcherCaps says what the packer really uses.
+  var batcher = null;
+  var batcherCaps = null;
+  function applyBatchSettings() {
+    batcher = createBatcher((settings && settings.batch) || {});
+    // The packer reports the numbers it was built with, so a log line or a
+    // __plamo.getBatcherCaps() answer can never disagree with the packer that
+    // actually packed the page.
+    batcherCaps = batcher.caps();
+    return batcher;
+  }
+  applyBatchSettings();
   var cache = new SessionCache();
   var abortRequested = false;
   var runSeq = 0;
@@ -95,13 +112,14 @@
   function emptySummary() {
     return {
       total: 0, translated: 0, failed: 0, cacheHits: 0, applied: 0, skipped: 0,
+      requests: 0, batches: 0, units: 0,
       elapsedMs: 0, firstTranslatedLatencyMs: 0, firstViewportLatencyMs: 0,
       errorCounts: {}, skipCounts: {}, errors: []
     };
   }
 
   function newStats() {
-    return { translated: 0, failed: 0, cacheHits: 0, applied: 0, skipped: 0, errorCounts: {}, skipCounts: {}, errors: [] };
+    return { translated: 0, failed: 0, cacheHits: 0, applied: 0, skipped: 0, requests: 0, errorCounts: {}, skipCounts: {}, errors: [] };
   }
 
   function countError(stats, kind) {
@@ -192,6 +210,8 @@
     stats.translated += translatedCount;
     stats.failed += failedCount;
     stats.cacheHits += res.cacheHits || 0;
+    stats.requests += (typeof res.requests === 'number') ? res.requests : 0;
+    if (live) live.requests = stats.requests;
     applyBatchResults(btag, res, segmentsById, stats);
 
     if (translatedCount && !latencies.firstTranslatedLatencyMs) {
@@ -210,7 +230,8 @@
     log.batch({
       batch: batchNumber, server: res.profile || 'unknown', segments: res.segments,
       estimatedTokens: batch.estimatedTokens, elapsedMs: res.elapsedMs, status: status,
-      cacheHits: res.cacheHits || 0
+      cacheHits: res.cacheHits || 0, requests: res.requests, units: batch.units,
+      strategy: res.strategy, align: res.align
     });
   }
 
@@ -222,12 +243,16 @@
     var tag = 'run#' + runId;
     live = {
       runId: runId, phase: 'loading-settings', segments: 0, batches: 0, sent: 0, inFlight: 0,
+      units: 0, requests: 0,
       translated: 0, failed: 0, cacheHits: 0, applied: 0, skipped: 0, errorCounts: {},
       skipCounts: {}, startedAt: Date.now()
     };
     log.info(tag + ' translatePage start (profile=' + (settings && settings.profileName) + ' cache=' + cache.map.size + ')');
     return loadSettings().then(function (s) {
       settings = s; // apply popup changes immediately
+      // The saved caps have to reach the packer, which was built before settings
+      // were loaded (see applyBatchSettings).
+      applyBatchSettings();
       var segments = buildSegments(root || document);
       live.segments = segments.length;
       log.info(tag + ' extracted segments=' + segments.length + ' viewport=' + JSON.stringify(countViewport(segments)) +
@@ -244,14 +269,24 @@
       segments = sortSegmentsByViewport(segments);
       var segmentsById = {};
       segments.forEach(function (s) { segmentsById[s.id] = s; });
-      var batches = batcher.batch(segments);
+      // One batch = one API request: the units are the blocks the segments came
+      // from, the batches are what one request will carry.
+      var unitList = batcher.units(segments);
+      var batches = batcher.batchUnits(segments);
       live.batches = batches.length;
+      live.units = unitList.length;
       var t0 = performance.now();
       var stats = newStats();
+      stats.batches = batches.length;
       var latencies = { t0: t0, firstTranslatedLatencyMs: 0, firstViewportLatencyMs: 0, viewportId: null };
       segments.forEach(function (s) { if (s.viewport === 1 && !latencies.viewportId) latencies.viewportId = s.id; });
+      log.info(tag + ' packing segments=' + segments.length + ' blocks=' + unitList.length +
+        ' requests=' + batches.length + ' caps=' + batcherCaps.maxSegmentsPerBatch + 'seg/' +
+        batcherCaps.maxEstimatedTokensPerBatch + 'tok first=' + batcherCaps.firstBatchMaxSegments +
+        ' strategy=' + ((settings.request && settings.request.strategy) || 'multi') +
+        ' (segments/request=' + (batches.length ? (segments.length / batches.length).toFixed(1) : '0') + ')');
       log.trace(tag + ' batches=' + batches.length + ' ' + batches.map(function (b, i) {
-        return '#' + (i + 1) + ':' + b.segments.length + 'seg/' + b.estimatedTokens + 'tok';
+        return '#' + (i + 1) + ':' + b.segments.length + 'seg/' + b.units + 'blk/' + b.estimatedTokens + 'tok';
       }).join(' '));
       live.phase = 'translating';
 
@@ -265,7 +300,10 @@
           batch: messaging.toWireBatch(batch),
           profileName: settings.profileName,
           concurrency: settings.maxConcurrent,
-          timeoutMs: C.DEFAULT_TIMEOUT_MS,
+          // No timeoutMs: a batched request answers many segments at once, so the
+          // background scales the timeout with the size of the batch.
+          strategy: (settings.request && settings.request.strategy) || undefined,
+          request: settings.request || undefined,
           cache: messaging.toWireCache(cache, batch.segments)
         };
         live.sent++;
@@ -292,6 +330,9 @@
           cacheHits: stats.cacheHits,
           applied: stats.applied,
           skipped: stats.skipped,
+          requests: stats.requests,
+          batches: batches.length,
+          units: unitList.length,
           elapsedMs: Math.round(performance.now() - t0),
           firstTranslatedLatencyMs: latencies.firstTranslatedLatencyMs,
           firstViewportLatencyMs: latencies.firstViewportLatencyMs,
@@ -304,7 +345,9 @@
         lastRun = summary;
         var endLine = tag + ' done total=' + summary.total + ' translated=' + summary.translated +
           ' applied=' + summary.applied + ' failed=' + summary.failed + ' skipped=' + summary.skipped +
-          ' cacheHits=' + summary.cacheHits + ' in ' + summary.elapsedMs + 'ms' +
+          ' cacheHits=' + summary.cacheHits + ' requests=' + summary.requests +
+          ' (' + summary.batches + ' request(s) for ' + summary.total + ' segment(s))' +
+          ' in ' + summary.elapsedMs + 'ms' +
           ' firstTranslated=' + summary.firstTranslatedLatencyMs + 'ms cache=' + cache.map.size;
         if (summary.failed) log.warn(endLine); else log.info(endLine);
         if (Object.keys(stats.errorCounts).length) {
@@ -403,6 +446,8 @@
       runId: l.runId || null,
       segments: l.segments || 0,
       batches: l.batches || 0,
+      units: l.units || 0,
+      requests: l.requests || 0,
       sent: l.sent || 0,
       inFlight: l.inFlight || 0,
       translated: l.translated || 0,
@@ -442,6 +487,34 @@
           parentTag: (s.source && s.source.parentTag) || '',
           cached: cache.map.has(s.text),
           text: s.text.slice(0, 60)
+        };
+      })
+    };
+  }
+
+  // How a run WOULD be packed, without sending a single request: the quick way
+  // to check the grouping on a real page. A wall of menu items should come back
+  // as a couple of big requests; if `requests` is close to `segments`, either the
+  // caps are too small or the texts are too long for one request.
+  function getBatchPlan(opts) {
+    var root = (opts && opts.root) || document;
+    applyBatchSettings();
+    var segments = sortSegmentsByViewport(buildSegments(root));
+    var unitList = batcher.units(segments);
+    var batches = batcher.batchUnits(segments);
+    return {
+      segments: segments.length,
+      blocks: unitList.length,
+      requests: batches.length,
+      segmentsPerRequest: batches.length ? Number((segments.length / batches.length).toFixed(1)) : 0,
+      caps: batcherCaps, // what the packer in use was built with
+      strategy: (settings && settings.request && settings.request.strategy) || C.REQUEST_SETTINGS.strategy,
+      viewport: countViewport(segments),
+      batches: batches.slice(0, (opts && opts.limit) || 8).map(function (b, i) {
+        return {
+          index: i + 1, segments: b.segments.length, blocks: b.units,
+          estimatedTokens: b.estimatedTokens,
+          sample: b.segments.slice(0, 3).map(function (s) { return s.text.slice(0, 40); })
         };
       })
     };
@@ -491,6 +564,10 @@
     // diagnostics
     getState: getState,
     getPending: getPending,
+    // How the next run would be packed into API requests (no request is sent).
+    getBatchPlan: getBatchPlan,
+    // The caps the packer in use was built with: proves a saved setting landed.
+    getBatcherCaps: function () { return Object.assign({}, batcherCaps); },
     // One row per text node whose nodeValue we replaced: { path, before, after }.
     getApplied: function (limit) { return renderer.appliedSample(limit); },
     scanStats: function () { return ns.extractor.scanStats(); },
