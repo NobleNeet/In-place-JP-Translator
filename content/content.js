@@ -104,6 +104,101 @@
     });
   }
 
+  // ---- the page <-> worker channel -------------------------------------
+  // chrome.runtime.sendMessage() answers on a one-shot channel, and that channel
+  // dies whenever the worker is recycled. One batch used to be one short request
+  // so nobody noticed; a batch is now many segments on one prompt and can run for
+  // minutes, which is exactly long enough for the channel to close first. The
+  // page then sees "A listener indicated an asynchronous response by returning
+  // true, but the message channel closed before a response was received" and the
+  // whole batch - often a paragraph's worth of text - is lost. A port the page
+  // keeps open for the length of a run answers whenever it is ready, and a
+  // connected port counts as activity for the worker, so it also keeps it alive.
+  var channel = null;
+
+  function closeChannel(reason) {
+    if (!channel) return;
+    var c = channel;
+    channel = null;
+    var ids = Object.keys(c.pending);
+    ids.forEach(function (id) {
+      var p = c.pending[id];
+      delete c.pending[id];
+      if (p && p.reject) p.reject(new Error('channel closed before ' + id + ' was answered' + (reason ? ' (' + reason + ')' : '')));
+    });
+    try { c.port.disconnect(); } catch (e) { /* already gone */ }
+    log.debug('channel closed' + (reason ? ' (' + reason + ')' : '') + ' requests=' + c.requests +
+      (ids.length ? ' UNANSWERED=' + ids.length : ''));
+  }
+
+  function openChannel(tag) {
+    closeChannel('re-open');
+    if (!chrome.runtime.connect) {
+      log.info(tag + ' no connect() available, every request goes over sendMessage (a long one can be lost)');
+      return null;
+    }
+    var port;
+    try {
+      port = chrome.runtime.connect({ name: C.PORT_TRANSLATE });
+    } catch (e) {
+      log.warn(tag + ' connect() failed, falling back to sendMessage per request: ' + lastErrorMessage(e));
+      return null;
+    }
+    var c = { port: port, pending: {}, requests: 0, openedAt: performance.now() };
+    channel = c;
+    port.onMessage.addListener(function (res) {
+      var id = res && res.requestId;
+      var p = c.pending[id];
+      if (!p) {
+        log.warn('channel: answer for unknown request "' + id + '" (waiting for: ' + (Object.keys(c.pending).join(',') || 'none') + ')');
+        return;
+      }
+      delete c.pending[id];
+      log.trace('resp ' + MSG_TRANSLATE + ' [' + id + '] over port in ' + Math.round(performance.now() - p.t0) + 'ms');
+      p.resolve(res);
+    });
+    port.onDisconnect.addListener(function () {
+      var why = chrome.runtime.lastError;
+      var ids = Object.keys(c.pending);
+      if (channel === c) channel = null;
+      var message = 'the extension worker went away ' + (ids.length ? 'with ' + ids.length + ' request(s) in flight' : 'while idle') +
+        (why && why.message ? ' :: ' + why.message : '');
+      if (ids.length) log.error('channel LOST: ' + message + ' (those batches are retried as smaller requests)');
+      else log.debug('channel closed: ' + message);
+      ids.forEach(function (id) {
+        var p = c.pending[id];
+        delete c.pending[id];
+        if (p && p.reject) p.reject(new Error(message + hintFor(message)));
+      });
+    });
+    log.info(tag + ' channel opened (port "' + C.PORT_TRANSLATE + '")');
+    return c;
+  }
+
+  // One request over the run's port, or over sendMessage when there is no port.
+  // Rejects only for transport problems; a failed *translation* is a result.
+  function sendTranslate(msg) {
+    var c = channel;
+    if (!c || !c.port) return sendRuntime(msg);
+    var id = msg.id || (msg.id = messaging.makeRequestId('msg'));
+    var t0 = performance.now();
+    c.requests++;
+    return new Promise(function (resolve, reject) {
+      c.pending[id] = { resolve: resolve, reject: reject, t0: t0 };
+      log.trace('send ' + messaging.summarizeMessage(msg) + ' over port');
+      try {
+        c.port.postMessage(msg);
+      } catch (e) {
+        delete c.pending[id];
+        reject(new Error('port postMessage failed: ' + lastErrorMessage(e)));
+      }
+    }).then(null, function (err) {
+      log.error('send ' + msg.type + ' [' + id + '] FAILED in ' + Math.round(performance.now() - t0) + 'ms :: ' +
+        lastErrorMessage(err) + hintFor(lastErrorMessage(err)));
+      throw err;
+    });
+  }
+
   function setStatus(status) {
     try { chrome.runtime.sendMessage({ type: MSG_STATUS, status: status }); }
     catch (e) { log.trace('setStatus("' + status + '") not delivered: ' + lastErrorMessage(e)); }
@@ -236,6 +331,70 @@
   }
 
 
+  // A batch whose request never came back - the worker was recycled, the channel
+  // closed, the request died at the timeout ceiling - is not written off. Its
+  // segments are re-sent as a few small requests, one after another so a page
+  // whose server is struggling is not flooded. This is what keeps "a few
+  // paragraphs of the page" from staying in English after one bad request.
+  function recoverBatch(btag, batchNumber, batch, segmentsById, stats, latencies) {
+    var per = (C.RECOVERY && C.RECOVERY.maxSegmentsPerRequest) || 6;
+    var maxReq = (C.RECOVERY && C.RECOVERY.maxRequests) || 12;
+    var chunks = batcher.split(batch, per);
+    var droppedSegs = 0;
+    if (chunks.length > maxReq) {
+      droppedSegs = batch.segments.length - maxReq * per;
+      log.warn(btag + ' recovery limited to ' + maxReq + ' request(s); ' + droppedSegs +
+        ' segment(s) are left untranslated (raise RECOVERY.maxRequests or lower the batch caps)');
+      chunks = chunks.slice(0, maxReq);
+    }
+    var retried = 0;
+    chunks.forEach(function (ch) { retried += ch.segments.length; });
+    log.warn(btag + ' RECOVERY: re-sending ' + retried + ' of ' + batch.segments.length + ' segment(s) as ' +
+      chunks.length + ' smaller request(s) (' + per + ' segment(s) each, sequential)');
+
+    var chain = Promise.resolve();
+    chunks.forEach(function (chunkBatch, ci) {
+      chain = chain.then(function () {
+        if (abortRequested) {
+          log.warn(btag + ' recovery stopped after ' + ci + ' chunk(s): stop requested');
+          return;
+        }
+        var retryTag = btag + ' retry#' + (ci + 1);
+        var payload = {
+          id: messaging.makeRequestId(btag.replace(/\s+/g, '-') + '-retry' + (ci + 1)),
+          type: MSG_TRANSLATE,
+          batch: messaging.toWireBatch(chunkBatch),
+          profileName: settings.profileName,
+          concurrency: settings.maxConcurrent,
+          strategy: (settings.request && settings.request.strategy) || undefined,
+          request: settings.request || undefined,
+          cache: messaging.toWireCache(cache, chunkBatch.segments)
+        };
+        live.sent++;
+        live.inFlight++;
+        // The retries go over sendMessage on purpose: the port is what died, and
+        // a small request is very likely to answer before anything else breaks.
+        return sendRuntime(payload).then(function (res) {
+          live.inFlight--;
+          handleBatchResponse(retryTag, batchNumber, chunkBatch, res, segmentsById, stats, latencies);
+        }, function (err) {
+          live.inFlight--;
+          stats.failed += chunkBatch.segments.length;
+          countError(stats, 'transport');
+          pushError(stats, lastErrorMessage(err));
+          log.error(retryTag + ' FAILED too, ' + chunkBatch.segments.length + ' segment(s) stay untranslated: ' +
+            lastErrorMessage(err) + hintFor(lastErrorMessage(err)) + ' :: ' + messaging.summarizeBatch(chunkBatch));
+        });
+      });
+    });
+    return chain.then(function () {
+      if (droppedSegs > 0) {
+        stats.failed += droppedSegs;
+        countError(stats, 'transport');
+      }
+    });
+  }
+
   function translatePage(root) {
     abortRequested = false;
     setStatus('translating');
@@ -289,6 +448,10 @@
         return '#' + (i + 1) + ':' + b.segments.length + 'seg/' + b.units + 'blk/' + b.estimatedTokens + 'tok';
       }).join(' '));
       live.phase = 'translating';
+      // One port for the whole run: it answers whenever a batch is ready instead
+      // of on a channel that closes under a minutes-long request.
+      openChannel(tag);
+      live.channel = channel ? 'port' : 'sendMessage';
 
       var promises = batches.map(function (batch, batchIndex) {
         var btag = tag + ' batch#' + (batchIndex + 1);
@@ -308,21 +471,24 @@
         };
         live.sent++;
         live.inFlight++;
-        return sendRuntime(payload).then(function (res) {
+        return sendTranslate(payload).then(function (res) {
           live.inFlight--;
           handleBatchResponse(btag, batchIndex + 1, batch, res, segmentsById, stats, latencies);
         }, function (err) {
           live.inFlight--;
           var message = lastErrorMessage(err);
-          stats.failed += batch.segments.length;
           countError(stats, 'transport');
           pushError(stats, message);
           log.error(btag + ' TRANSPORT FAILURE for ' + batch.segments.length + ' segment(s): ' + message +
             hintFor(message) + ' :: ' + messaging.summarizeBatch(batch));
+          // Nothing was written, so nothing is lost yet: give the segments a
+          // second chance in requests small enough to answer.
+          return recoverBatch(btag, batchIndex + 1, batch, segmentsById, stats, latencies);
         });
       });
 
       return Promise.all(promises).then(function () {
+        closeChannel('run#' + runId + ' finished');
         var summary = {
           total: segments.length,
           translated: stats.translated,
@@ -362,6 +528,7 @@
         return summary;
       });
     }).catch(function (err) {
+      closeChannel('run#' + runId + ' aborted');
       if (live) live.phase = 'idle';
       setStatus('idle');
       log.error(tag + ' ABORTED: ' + lastErrorMessage(err) +
@@ -458,6 +625,9 @@
       errorCounts: l.errorCounts || {},
       skipCounts: l.skipCounts || {},
       renderedNodes: renderer.appliedCount(),
+      // How the last/current run talks to the worker: 'port' is the durable
+      // channel, 'sendMessage' means connect() was unavailable to this page.
+      channel: l.channel || (channel ? 'port' : 'sendMessage'),
       abortRequested: abortRequested,
       cache: { entries: cache.map.size, hits: cache.hits, misses: cache.misses },
       profile: settings.profileName || null,
@@ -568,6 +738,15 @@
     getBatchPlan: getBatchPlan,
     // The caps the packer in use was built with: proves a saved setting landed.
     getBatcherCaps: function () { return Object.assign({}, batcherCaps); },
+    // Which page<->worker channel the current/last run used. 'port' is the
+    // durable one a batched request needs; 'sendMessage' means connect() was not
+    // available and a minutes-long request may be lost in transport.
+    getChannel: function () {
+      return channel
+        ? { kind: 'port', name: C.PORT_TRANSLATE, requests: channel.requests, pending: Object.keys(channel.pending) }
+        : { kind: 'none', name: C.PORT_TRANSLATE, requests: 0, pending: [] };
+    },
+    getRecoveryCaps: function () { return Object.assign({}, C.RECOVERY); },
     // One row per text node whose nodeValue we replaced: { path, before, after }.
     getApplied: function (limit) { return renderer.appliedSample(limit); },
     scanStats: function () { return ns.extractor.scanStats(); },

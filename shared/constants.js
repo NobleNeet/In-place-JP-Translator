@@ -13,6 +13,23 @@
     // log ring buffer (the service-worker console is hard to reach on Vivaldi).
     MSG_PING: 'plamo.ping',
     MSG_DIAGNOSTICS: 'plamo.diagnostics',
+    // Long-lived port used for translation requests (chrome.runtime.connect).
+    // sendMessage()'s one-shot response channel only survives while the worker
+    // lives and answers on the same channel; a batched request can run for
+    // minutes, and when the channel dies the whole batch is lost. A port the
+    // page holds open answers whenever it is ready and keeps the worker alive.
+    PORT_TRANSLATE: 'plamo.translate-channel',
+
+    // One API request must never be allowed to run for minutes: past a couple
+    // of minutes the extension's own messaging/worker lifetime, not the server,
+    // decides the outcome, and the failure arrives as an unusable
+    // "message channel closed" instead of a timeout we can retry. Every
+    // per-request timeout below is clamped to this ceiling.
+    MAX_REQUEST_TIMEOUT_MS: 90000,
+
+    // When a batch dies in transport (channel closed, worker recycled) its
+    // segments are not written off: they are re-sent as a few small requests.
+    RECOVERY: { maxSegmentsPerRequest: 6, maxRequests: 12 },
 
     DEFAULT_PROFILE: 'evo-x2-plamo2',
     DEFAULT_MODE: 'single',
@@ -24,17 +41,19 @@
 
     // A batch is now ONE API request (see api/openai-client.js translateSegments):
     // every segment of a batch travels as one line of a single prompt, so the
-    // caps below are caps on a request, not on a message. The token budget is
-    // what actually matters (input + output of one request); the segment cap is
-    // only there to stop a page of 2-letter menu items from making one giant
-    // request that the model answers with the wrong number of lines.
+    // caps below are caps on a request, not on a message. Batching saves the
+    // prompt/prefill round trips, NOT the decoding: a model still writes the
+    // answers one after another, so a request costs roughly the sum of its
+    // segments. That is what keeps these caps modest - a 48-segment request on a
+    // small local model was measured at over 6 minutes, which is longer than the
+    // extension's own messaging lifetime (see MAX_REQUEST_TIMEOUT_MS).
     BATCH_SETTINGS: {
-      maxSegmentsPerBatch: 48,
-      maxEstimatedTokensPerBatch: 3000,
+      maxSegmentsPerBatch: 24,
+      maxEstimatedTokensPerBatch: 900,
       charPerToken: 4,
       // The first batch is the visible part of the page: keeping it small is
       // what keeps the perceived speed while later batches go out big.
-      firstBatchMaxSegments: 10
+      firstBatchMaxSegments: 8
     },
 
     // 'multi'  = one request per batch (fast, this is the default now)
@@ -52,8 +71,11 @@
       // something like "Translate each line into Japanese, keep the line count"
       // if a server answers batched prompts in the wrong shape.
       batchSystemPrompt: '',
-      timeoutBaseMs: 120000,    // request timeout for a batched request ...
-      timeoutPerTokenMs: 30,    // ... plus this per estimated token of the batch
+      // The timeout of one request is base + perToken x estimatedTokens, and is
+      // then clamped to constants MAX_REQUEST_TIMEOUT_MS: past that ceiling the
+      // extension's own messaging lifetime decides the outcome, not the server.
+      timeoutBaseMs: 45000,      // request timeout for a batched request ...
+      timeoutPerTokenMs: 50,     // ... plus this per estimated token of the batch
       maxTokensPerRequest: 0    // 0 = omit max_tokens and trust the server default
     },
 

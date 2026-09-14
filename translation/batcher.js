@@ -130,10 +130,41 @@
       return batches;
     }
 
+    // One request died in transport, but its segments still have to be sent: cut
+    // a batch into requests of at most maxSegments each. Tokens are re-estimated
+    // per part, so the smaller requests also get the shorter timeout they
+    // deserve, and the block/container keys are counted for the log line only.
+    function split(batchToSplit, maxSegments) {
+      var per = (typeof maxSegments === 'number' && maxSegments > 0) ? maxSegments : maxSegmentsPerBatch;
+      var segs = (batchToSplit && batchToSplit.segments) || [];
+      var parts = [];
+      var i;
+      for (i = 0; i < segs.length; i += per) {
+        var chunk = segs.slice(i, i + per);
+        var tokens = 0;
+        var keys = {};
+        var units = 0;
+        chunk.forEach(function (seg) {
+          tokens += estimateTokens(seg.text);
+          var key = seg.block || seg.container || null;
+          if (key && !keys[key]) { keys[key] = 1; units++; }
+        });
+        parts.push({
+          segments: chunk,
+          estimatedTokens: tokens,
+          units: units || chunk.length,
+          // A part of a broken batch is not a first batch.
+          first: false
+        });
+      }
+      return parts;
+    }
+
     return {
       batch: batch,
       batchUnits: batchUnits,
       units: units,
+      split: split,
       estimateTokens: estimateTokens,
       // What this packer was actually built with: the first-batch cap never
       // exceeds the normal one, and callers log these numbers instead of the

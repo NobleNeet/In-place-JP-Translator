@@ -27,14 +27,61 @@ const _d = {};
 // call them the way Chrome would) and runtime.sendMessage from a content script
 // is routed to the background listener, including the "port closed" case that
 // happens when a listener answers asynchronously without returning true.
+// Port emulation for the durable translate channel: connect() hands back the
+// page side of a pair, the worker side goes to the onConnect listeners. A pair
+// can be killed to replay the case that started all this: the worker goes away
+// while a request is in flight, so the page's answer never arrives.
+function mkEvents() { return { listeners: [], addListener(fn) { this.listeners.push(fn); } }; }
+const portPairs = [];
+function killPortPair(pair, message) {
+  if (pair.dead) return;
+  pair.dead = true;
+  chromeFake.runtime.lastError = { message: message || 'The service worker has been recycled.' };
+  // The worker end goes first: that is the side that notices it lost requests.
+  pair.bg.onDisconnect.listeners.slice().forEach((f) => f());
+  pair.client.onDisconnect.listeners.slice().forEach((f) => f());
+  chromeFake.runtime.lastError = null;
+}
+function makePortPair(name) {
+  const pair = { name: name, dead: false };
+  pair.client = { name: name, onMessage: mkEvents(), onDisconnect: mkEvents() };
+  pair.bg = { name: name, sender: { id: 'test-extension' }, onMessage: mkEvents(), onDisconnect: mkEvents() };
+  pair.client.postMessage = (m) => {
+    if (pair.dead) return;
+    bag.portRequests++;
+    if (bag.portDieAfter && bag.portRequests >= bag.portDieAfter) {
+      killPortPair(pair, 'worker recycled with ' + bag.portRequests + ' request(s) posted');
+      return;
+    }
+    pair.bg.onMessage.listeners.slice().forEach((f) => f(m, pair.bg));
+  };
+  pair.bg.postMessage = (m) => {
+    if (pair.dead) return;
+    pair.client.onMessage.listeners.slice().forEach((f) => f(m, pair.client));
+  };
+  pair.client.disconnect = () => {
+    if (pair.dead) return;
+    pair.dead = true;
+    pair.bg.onDisconnect.listeners.slice().forEach((f) => f());
+  };
+  portPairs.push(pair);
+  return pair;
+}
+
 const chromeFake = {
   storage: { local: { get: async () => Object.assign({}, _d), set: async (o) => { Object.assign(_d, o); } } },
   runtime: {
     id: 'test-extension',
     lastError: null,
     onMessage: { listeners: [], addListener(fn) { this.listeners.push(fn); } },
+    onConnect: { listeners: [], addListener(fn) { this.listeners.push(fn); } },
     onInstalled: { addListener() {} },
     getManifest: () => ({ version: '0.1.0' }),
+    connect(opts) {
+      const pair = makePortPair((opts && opts.name) || '');
+      chromeFake.runtime.onConnect.listeners.slice().forEach((f) => f(pair.bg));
+      return pair.client;
+    },
     sendMessage(msg, cb) {
       const target = chromeFake.runtime.onMessage.listeners[bag.bgListenerIndex];
       if (!target) return;
@@ -53,7 +100,7 @@ const chromeFake = {
   },
   tabs: { query: (_q, cb) => cb([{ id: 1 }]), sendMessage(tabId, msg, cb) { cb(undefined); } }
 };
-const bag = { bgListenerIndex: -1, listenerCounts: {} };
+const bag = { bgListenerIndex: -1, listenerCounts: {}, portRequests: 0, portDieAfter: 0 };
 
 // Fake API server: records the last fetch call so the client's resolved URL and
 // request body can be asserted, and can be flipped into failure modes.
@@ -455,11 +502,95 @@ async function main() {
   ok('worker keeps a request counter', typeof ns.background.state.requests === 'number' && ns.background.state.requests > 0,
     JSON.stringify(stateAfter.payload.state || {}));
 
+  console.log('== durable port channel (a batched request outlives sendMessage) ==');
+  // The page-side of a port, plus the two outcomes that matter: an answer, and a
+  // worker that went away before answering.
+  function portCall(msg, waitMs) {
+    const client = chromeFake.runtime.connect({ name: ns.constants.PORT_TRANSLATE });
+    const seen = { answer: 'NO-ANSWER', disconnected: false };
+    client.onMessage.addListener((p) => { seen.answer = p; });
+    client.onDisconnect.addListener(() => { seen.disconnected = true; });
+    client.postMessage(msg);
+    setTimeout(() => client.disconnect(), waitMs || 120);
+    return new Promise((resolve) => setTimeout(() => resolve(seen), (waitMs || 120) + 30));
+  }
+  function portBatchMsg(id) {
+    return {
+      type: ns.constants.MSG_TRANSLATE, id: id, profileName: 'local-plamo2', strategy: 'multi',
+      batch: { estimatedTokens: 12, units: 2, segments: threeSegs.map((s) => Object.assign({}, s)) },
+      concurrency: 2, cache: {}
+    };
+  }
+  resetServer('echo_lines');
+  const portOk = await portCall(portBatchMsg('port-ok'), 150);
+  ok('the worker answers over the port', portOk.answer !== 'NO-ANSWER' && portOk.answer.status === 'success', JSON.stringify(portOk.answer).slice(0, 120));
+  ok('the answer carries the request id the page matches on', portOk.answer.requestId === 'port-ok');
+  ok('every segment came back aligned over the port', portOk.answer.translated === 3 && portOk.answer.requests === 1,
+    JSON.stringify(portOk.answer.align));
+  ok('port opened and closed are logged', ns.logger.getLogs({ contains: 'opened from' }).length >= 1 &&
+    ns.logger.getLogs({ contains: 'closed after' }).length >= 1);
+
+  // The failure that used to swallow a whole batch: the worker dies while the
+  // request is running. It must be written down with how many it lost.
+  resetServer('hang');
+  const hangPair = makePortPair(ns.constants.PORT_TRANSLATE);
+  chromeFake.runtime.onConnect.listeners.slice().forEach((f) => f(hangPair.bg));
+  hangPair.client.postMessage({
+    type: ns.constants.MSG_TRANSLATE, id: 'port-hang', profileName: 'local-plamo2', strategy: 'multi',
+    batch: { estimatedTokens: 4, segments: [{ id: 'h1', text: 'Hanging line', estimatedTokens: 4, viewport: 1 }] },
+    concurrency: 2, timeoutMs: 40000, cache: {}
+  });
+  await new Promise((r) => setTimeout(r, 40));
+  killPortPair(hangPair, 'worker recycled mid-request');
+  const lostLogs = ns.logger.getLogs({ contains: 'STILL IN FLIGHT' });
+  ok('a worker that died mid-request logs the requests it lost', lostLogs.length === 1,
+    JSON.stringify(lostLogs.map((r) => r.text.slice(0, 60))));
+
+  // A batched request may never be given minutes to run: past the ceiling the
+  // extension messaging, not the server, decides the outcome.
+  resetServer('echo_lines');
+  await bgCall({
+    type: ns.constants.MSG_TRANSLATE, id: 'bg-cap', profileName: 'local-plamo2', strategy: 'multi',
+    batch: { estimatedTokens: 4000, units: 1, segments: threeSegs.map((s) => Object.assign({}, s)) },
+    concurrency: 2, cache: {}
+  });
+  const capLog = ns.logger.getLogs({ contains: 'capped at ' + ns.constants.MAX_REQUEST_TIMEOUT_MS + 'ms' });
+  const wanted = 45000 + 4000 * 50;
+  const capWanted = ns.logger.getLogs({ contains: 'capped at ' + ns.constants.MAX_REQUEST_TIMEOUT_MS + 'ms from ' + wanted + 'ms' });
+  ok('the batch timeout is clamped to the ceiling', capLog.length >= 1, capLog.length + ' clamp log line(s)');
+  ok('the clamp names the number it overrode', capWanted.length === 1,
+    capWanted.length === 1 ? capWanted[0].text.slice(capWanted[0].text.indexOf('timeout='), capWanted[0].text.indexOf('cache=')) : 'none');
+
+  // A request that failed as a whole still owes every segment one more try:
+  // 'nothing came back' is exactly what a smaller request can fix.
+  const emptyRun = await bgBatch('bg-empty', 'multi', 'empty');
+  ok('an answer of nothing is retried one segment at a time', emptyRun.r.payload.align.fallback === 3 &&
+    emptyRun.r.payload.failed === 3, JSON.stringify(emptyRun.r.payload.align));
+  ok('the retry requests are counted too', emptyRun.r.payload.requests === 4, emptyRun.r.payload.requests);
+
+  console.log('== split a batch that died in transport ==');
+  const manySegs = [];
+  for (let i = 0; i < 16; i++) {
+    manySegs.push({ id: 'x' + i, text: 'sentence number ' + i + ' with a few words', estimatedTokens: 6, block: 'b' + Math.floor(i / 8) });
+  }
+  const parts = pb.split({ segments: manySegs, estimatedTokens: 200 }, 6);
+  ok('16 segments become requests of 6+6+4', parts.length === 3 && parts.map((p) => p.segments.length).join('+') === '6+6+4',
+    parts.map((p) => p.segments.length).join('+'));
+  ok('every segment is retried exactly once', parts.reduce((n, p) => n + p.segments.length, 0) === 16);
+  ok('each part re-estimates its own tokens', parts.every((p) => p.estimatedTokens > 0) && parts[0].estimatedTokens < 200,
+    parts.map((p) => p.estimatedTokens).join('+'));
+  ok('each part counts the blocks it carries', parts[0].units === 1 && parts[2].units === 1, parts.map((p) => p.units).join('+'));
+  ok('split without a size falls back to the packer cap', pb.split({ segments: manySegs }).length === 1);
+  ok('a batch of nothing splits into nothing', pb.split({ segments: [] }, 6).length === 0);
+
   console.log('== content diagnostics API ==');
   const api = sandbox.window.__plamo;
   ok('window.__plamo exposed', typeof api === 'object' && api !== null);
-  ['getState', 'getPending', 'getLogs', 'dumpLogs', 'backgroundLogs', 'pingBackground', 'translatePage', 'restoreAll', 'getCache', 'getSettings', 'getBatchPlan', 'getBatcherCaps']
+  ['getState', 'getPending', 'getLogs', 'dumpLogs', 'backgroundLogs', 'pingBackground', 'translatePage', 'restoreAll', 'getCache', 'getSettings', 'getBatchPlan', 'getBatcherCaps', 'getChannel', 'getRecoveryCaps']
     .forEach(fn => ok('__plamo.' + fn + '()', typeof api[fn] === 'function'));
+  ok('getChannel names the durable channel', api.getChannel().name === ns.constants.PORT_TRANSLATE &&
+    api.getChannel().kind === 'none', JSON.stringify(api.getChannel()));
+  ok('the recovery chunk size is a constant', api.getRecoveryCaps().maxSegmentsPerRequest === ns.constants.RECOVERY.maxSegmentsPerRequest);
   await chromeFake.storage.local.set({ plamo: { profileName: 'local-plamo2', maxConcurrent: 3, batch: { maxSegmentsPerBatch: 8, firstBatchMaxSegments: 4 }, request: { strategy: 'single' } } });
   await api.translatePage(); // reads settings, then rebuilds the packer from them
   ok('saved segment caps reach the packer in use', api.getBatcherCaps().maxSegmentsPerBatch === 8 &&

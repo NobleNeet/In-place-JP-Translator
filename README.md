@@ -163,8 +163,8 @@ were re-requested one by one.
 Start / completion summary from the content script:
 
 ```
-[PLaMoTranslate] packing segments=412 blocks=268 requests=14 caps=48seg/3000tok first=10 strategy=multi (segments/request=29.4)
-[PLaMoTranslate] done total=412 translated=410 applied=410 failed=2 skipped=0 cacheHits=3 requests=16 (14 request(s) for 412 segment(s)) in 9821ms firstTranslated=612ms cache=409
+[PLaMoTranslate] packing segments=412 blocks=268 requests=24 caps=24seg/900tok first=8 strategy=multi (segments/request=17.2)
+[PLaMoTranslate] done total=412 translated=410 applied=410 failed=2 skipped=0 cacheHits=3 requests=26 (24 request(s) for 412 segment(s)) in 9821ms firstTranslated=612ms cache=409
 ```
 
 You can also inspect live state from the console:
@@ -179,6 +179,8 @@ window.__plamo.getCache()      // SessionCache { map, hits, misses }
 window.__plamo.getSettings()   // current settings
 window.__plamo.getBatchPlan()  // how the next run would be packed: { segments, blocks, requests, segmentsPerRequest, caps, strategy, batches }
 window.__plamo.getBatcherCaps()// the caps the packer in use was built with (proves a saved setting landed)
+window.__plamo.getChannel()    // { kind: 'port'|'none', name, requests, pending } — is the run on the durable channel?
+window.__plamo.getRecoveryCaps()// { maxSegmentsPerRequest, maxRequests } used when a request dies in transport
 ```
 
 ---
@@ -220,11 +222,14 @@ All of these are in the popup and apply to the **next** "Translate Page" press.
   in flight at once, enforced by a semaphore (`translation/scheduler.js`). With
   multi-segment packing a slot is a whole *request*, so this limits requests,
   not text nodes.
-- **Segments per request** (default 48): how many text nodes one request
-  carries. A batch is also capped by estimated tokens (3000), so long prose
+- **Segments per request** (default 24): how many text nodes one request
+  carries. A batch is also capped by estimated tokens (900), so long prose
   produces smaller batches on its own. The **first** batch is deliberately
-  smaller (`firstBatchMaxSegments`, default 10) so the visible area is not held
-  up behind one big request.
+  smaller (`firstBatchMaxSegments`, default 8) so the visible area is not held
+  up behind one big request. Batching saves the prompt/prefill round trips, not
+  the decoding — a model still writes the answers one after another, so a request
+  costs roughly the sum of its segments and a big cap buys nothing but a big
+  blast radius when one request dies.
 - **Request packing**: `multi` (default — one request per batch, one text node
   per line) or `single` (one request per text node, i.e. the previous
   behaviour, kept for A/B comparison).
@@ -240,6 +245,47 @@ retried once with numbered lines, and whatever still cannot be placed is
 requested again one segment per request. Watch `align=` in the per-batch log to
 see how often that happens; `__plamo.getBatchPlan()` tells you what a run would
 cost before you start it.
+
+### One request has to stay short (channel, timeout ceiling, recovery)
+
+A batch is one API request, and one request now answers many text nodes, so it
+can run for a long time. Two limits come from the extension itself rather than
+from the server, and both used to lose whole paragraphs silently:
+
+- **The page <-> worker channel.** `chrome.runtime.sendMessage()` answers on a
+  one-shot channel that closes when the worker is recycled, which produced
+  `A listener indicated an asynchronous response by returning true, but the
+  message channel closed before a response was received` and dropped every
+  segment of that batch. Translation requests therefore go over a **port**
+  (`plamo.translate-channel`) that the page keeps open for the length of a run:
+  it answers whenever a batch is ready, a connected port also keeps the worker
+  alive, and a worker that dies mid-request is logged as
+  `port#1 closed ... WITH 1 REQUEST(S) STILL IN FLIGHT`. `sendMessage` is still
+  accepted (a page whose `connect()` failed), and `__plamo.getChannel()` reports
+  which channel a run used.
+- **The per-request timeout ceiling.** The timeout of a batched request is
+  `timeoutBaseMs + timeoutPerTokenMs x estimatedTokens`, then clamped to
+  `MAX_REQUEST_TIMEOUT_MS` (90 s). A request that is allowed to run for six
+  minutes is not a patient client — it is a batch that will come back as a
+  transport error. When the clamp fires the log says so:
+  `timeout=90000ms batchTimeout=90000ms (capped at 90000ms from 245000ms: ...)`.
+  If you see that line often, pack smaller (lower *Segments per request* or the
+  token cap) instead of raising the ceiling.
+
+Nothing is written off when a request dies anyway. A batch whose request never
+came back is re-sent as small requests:
+
+```
+[PLaMoTranslate] run#1 batch#28 TRANSPORT FAILURE for 16 segment(s): ...
+[PLaMoTranslate] run#1 batch#28 RECOVERY: re-sending 16 of 16 segment(s) as 3 smaller request(s) (6 segment(s) each, sequential)
+```
+
+Inside the worker the same idea applies per failure kind: a batch that timed
+out, answered nothing, or could not be split back by line count gets one more
+attempt per segment, while a 404/connection error is *not* retried 16 times
+(that log line names the reason: `not retried one by one: the request itself
+failed (http_error)`). The retry sizes are `RECOVERY.maxSegmentsPerRequest` (6)
+and `RECOVERY.maxRequests` (12) in `shared/constants.js`.
 
 ---
 
@@ -260,7 +306,12 @@ cost before you start it.
 - [x] Alignment safety: numbered retry, then per-segment fallback, never a
       guessed line placement
 - [x] Bounded concurrency (1/2/4/8) with semaphore
-- [x] 120s timeout + AbortController
+- [x] Timeout + AbortController, with a hard per-request ceiling
+      (`MAX_REQUEST_TIMEOUT_MS`) so a request never outlives extension messaging
+- [x] Durable page<->worker channel (`chrome.runtime.connect` port) for translate
+      requests, with `sendMessage` kept as a fallback
+- [x] Transport-failure recovery: a batch whose request died is re-sent as
+      several small requests instead of losing its segments
 - [x] Per-segment error isolation (one batch failing doesn't stop the rest)
 - [x] Session cache for duplicate text
 - [x] Original text preserved in `data-*` attributes

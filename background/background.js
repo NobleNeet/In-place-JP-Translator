@@ -123,12 +123,24 @@ importScripts(
     var R = Object.assign({}, C.REQUEST_SETTINGS, opts.request || {});
     var strategy = (C.REQUEST_STRATEGIES.indexOf(opts.strategy) !== -1) ? opts.strategy : (R.strategy || C.REQUEST_SETTINGS.strategy);
     var explicitTimeout = (typeof opts.timeoutMs === 'number' && opts.timeoutMs > 0);
-    var timeoutMs = explicitTimeout ? opts.timeoutMs : C.DEFAULT_TIMEOUT_MS;
+    // A request that is *allowed* to run for minutes is not a patient client, it
+    // is a batch that will come back as "the message channel closed before a
+    // response was received" (the worker gets recycled long before). So both
+    // timeouts are clamped to MAX_REQUEST_TIMEOUT_MS: better a clean timeout
+    // error, which the retry and the per-segment fallback can act on.
+    var capMs = C.MAX_REQUEST_TIMEOUT_MS || C.DEFAULT_TIMEOUT_MS;
+    var timeoutWanted = explicitTimeout ? opts.timeoutMs : C.DEFAULT_TIMEOUT_MS;
+    var timeoutMs = Math.min(timeoutWanted, capMs);
     var batchTokens = (typeof batch.estimatedTokens === 'number') ? batch.estimatedTokens : 0;
     // A batched request answers many segments at once, so it gets its own,
     // longer timeout that grows with the amount of text in it.
-    var batchTimeoutMs = explicitTimeout ? opts.timeoutMs
+    var batchTimeoutWanted = explicitTimeout ? opts.timeoutMs
       : Math.round((R.timeoutBaseMs || C.DEFAULT_TIMEOUT_MS) + batchTokens * (R.timeoutPerTokenMs || 0));
+    var batchTimeoutMs = Math.min(batchTimeoutWanted, capMs);
+    var cappedNote = (batchTimeoutMs < batchTimeoutWanted || timeoutMs < timeoutWanted)
+      ? ' (capped at ' + capMs + 'ms from ' + Math.max(batchTimeoutWanted, timeoutWanted) +
+        'ms: a longer request outlives the extension message channel)'
+      : '';
     var guardMs = timeoutMs + 5000;        // the client aborts at timeoutMs; this only fires if it never returns
     var batchGuardMs = batchTimeoutMs + 5000;
     var cache = messaging.normalizeCache(opts.cache);
@@ -136,7 +148,7 @@ importScripts(
 
     log.debug(tag + ' start ' + messaging.summarizeBatch(batch) + ' | ' + profiles.describeProfile(profile) +
       ' | POST ' + profiles.resolveEndpointUrl(profile) + ' | strategy=' + strategy +
-      ' | timeout=' + timeoutMs + 'ms batchTimeout=' + batchTimeoutMs + 'ms' +
+      ' | timeout=' + timeoutMs + 'ms batchTimeout=' + batchTimeoutMs + 'ms' + cappedNote +
       ' | cache=' + cache.form + '(' + cache.size + ')' + ' | limit=' + conc.limit +
       ' active=' + conc.active + ' pending=' + conc.pending);
 
@@ -299,10 +311,32 @@ importScripts(
       if (strategy !== 'single' && pending.length > 1) {
         // One limiter slot for the whole batch: a slot is a request now.
         await semaphore.run(function () { return batchRequest(pending); });
+        var retryableFailure = function (r) {
+          // 'align'  : the answer did not split back into lines;
+          // 'timeout' : the request died at the ceiling (a too-big batch);
+          // 'empty_response' : the model answered nothing to a batch prompt.
+          return !r || r.errorType === 'align' || r.errorType === 'timeout' || r.errorType === 'empty_response';
+        };
         var unplaced = pending.filter(function (segment) {
           var r = results[segment.id];
-          return !r || r.errorType === 'align';
+          if (r && r.translatedText) return false;
+          // A server that answered 404/500 or refused the connection will not do
+          // better when asked 16 more times, so only the failures that mean "the
+          // answer was unusable, or never came in time" are retried one by one.
+          // The timeout case matters most: a batched request is capped to
+          // MAX_REQUEST_TIMEOUT_MS, so a too-big batch times out as a whole and
+          // each of its segments is worth a second, smaller attempt.
+          return retryableFailure(r);
         });
+        var hardFailed = pending.filter(function (segment) {
+          var r = results[segment.id];
+          return r && r.error && !retryableFailure(r);
+        });
+        if (hardFailed.length && !unplaced.length) {
+          log.warn(tag + ' ' + hardFailed.length + ' segment(s) not retried one by one: the request itself failed (' +
+            hardFailed.map(function (segment) { return results[segment.id].errorType; })
+              .filter(function (v, i, a) { return a.indexOf(v) === i; }).join(',') + ')');
+        }
         if (unplaced.length && R.perSegmentFallback) {
           align.fallback = unplaced.length;
           log.warn(tag + ' ' + unplaced.length + ' of ' + pending.length + ' segment(s) fall back to one request each');
@@ -375,10 +409,122 @@ importScripts(
     return response;
   }
 
-  // The returned boolean matters: returning true keeps the message port open so
-  // the asynchronous sendResponse() still reaches the sender. Returning
-  // undefined closes the port at once and the sender sees
-  // "The message port closed before a response was received."
+  // Runs one translate request and hands the finished answer to `respond`.
+  // Both entry points - sendMessage and the long-lived port - go through here,
+  // so the two channels can never disagree about what a request does.
+  function runTranslate(msg, respond, tag, from) {
+    var requestId = (msg && msg.id) || '-';
+    log.debug('recv ' + messaging.summarizeMessage(msg) + ' from ' + from);
+    if (ns.logger.isVerbose()) messaging.warnUnserializable(msg, 'MSG_TRANSLATE');
+    state.lastRequest = { id: requestId, at: Date.now(), from: from, summary: messaging.summarizeMessage(msg) };
+
+    var running;
+    try {
+      running = Promise.resolve(translateBatch(msg.batch, {
+        requestId: requestId,
+        profileName: msg.profileName || msg.profile,
+        concurrency: msg.concurrency,
+        timeoutMs: msg.timeoutMs,
+        strategy: msg.strategy,
+        request: msg.request,
+        cache: msg.cache,
+        rawSummary: messaging.summarizeMessage(msg)
+      }));
+    } catch (syncErr) {
+      running = Promise.reject(syncErr); // e.g. an unknown profile name
+    }
+
+    running.then(function (res) {
+      respond(res, tag);
+    }, function (err) {
+      var message = String((err && err.message) || err);
+      log.error(tag + ' translateBatch THREW ' + message +
+        ' stack=' + String((err && err.stack) || '').split('\n').slice(0, 4).join(' | '));
+      respond({
+        requestId: requestId,
+        status: 'failure',
+        error: message,
+        errorType: 'internal',
+        segments: (msg.batch && msg.batch.segments && msg.batch.segments.length) || 0,
+        estimatedTokens: (msg.batch && msg.batch.estimatedTokens) || 0,
+        results: {}, translated: 0, failed: (msg.batch && msg.batch.segments && msg.batch.segments.length) || 0,
+        cacheHits: 0, elapsedMs: 0
+      }, tag);
+    });
+  }
+
+  // Translation requests normally come over this port instead of sendMessage.
+  // A batched request can take minutes, and sendMessage's one-shot response
+  // channel does not last that long: when the worker is recycled mid-request the
+  // page only sees "A listener indicated an asynchronous response by returning
+  // true, but the message channel closed before a response was received" and the
+  // whole batch is lost. A port the page holds open answers whenever it is ready
+  // (and a connected port counts as activity for the worker), and its disconnect
+  // is logged with the requests that were still in flight, so the event that
+  // killed a batch is visible in the diagnostics instead of being guessed at.
+  var portSeq = 0;
+  chrome.runtime.onConnect.addListener(function (port) {
+    if (!port || port.name !== C.PORT_TRANSLATE) {
+      var foreignName = port && port.name;
+      if (foreignName) log.debug('ignoring port "' + foreignName + '" (this worker serves "' + C.PORT_TRANSLATE + '")');
+      return;
+    }
+    var pid = 'port#' + (++portSeq);
+    var from = describeSender(port.sender);
+    var inFlight = 0;
+    var openedAt = Date.now();
+    log.debug(pid + ' opened from ' + from + ' (' + C.PORT_TRANSLATE + ')');
+
+    port.onMessage.addListener(function (msg) {
+      var type = msg && msg.type;
+      var requestId = (msg && msg.id) || '-';
+      var tag = 'batch[' + requestId + ']';
+      if (type === MSG_PING) {
+        port.postMessage(Object.assign({ ok: true, pong: true, via: 'port' }, semaphoreSnapshot()));
+        return;
+      }
+      if (type !== MSG_TRANSLATE) {
+        log.warn(pid + ' unknown message type "' + type + '" (' + requestId + ') | handled: ' + C.MSG_TRANSLATE + ', ' + MSG_PING);
+        port.postMessage({ error: 'unknown message type on port: ' + type, errorType: 'config' });
+        return;
+      }
+      state.messages++;
+      inFlight++;
+      runTranslate(msg, function (payload) {
+        inFlight--;
+        try {
+          port.postMessage(payload);
+          if (ns.logger.isVerbose()) {
+            var size = 0;
+            try { size = JSON.stringify(payload).length; } catch (e) { size = -1; }
+            log.trace(tag + ' replied over ' + pid + ' bytes=' + size);
+          }
+        } catch (e) {
+          log.warn(tag + ' port postMessage threw (' + pid + ' gone?): ' + String((e && e.message) || e));
+        }
+      }, tag, from + ' ' + pid);
+    });
+
+    port.onDisconnect.addListener(function () {
+      var why = chrome.runtime.lastError;
+      var ms = Date.now() - openedAt;
+      var line = pid + ' closed after ' + ms + 'ms from ' + from + ' (requests answered on it: ' + state.requests + ')';
+      if (inFlight > 0) {
+        log.warn(line + ' WITH ' + inFlight + ' REQUEST(S) STILL IN FLIGHT: the worker was recycled (or crashed) ' +
+          'mid-request, so those batches are lost in transport. The page retries them as smaller requests; ' +
+          'if this repeats, lower "Segments per request".' +
+          (why ? ' :: lastError=' + why.message : ''));
+      } else {
+        log.debug(line + (why ? ' :: lastError=' + why.message : ''));
+      }
+    });
+  });
+
+
+  // The returned boolean matters for sendMessage: returning true keeps the
+  // response channel open so an asynchronous sendResponse() still reaches the
+  // sender. Long translate requests belong on the port above, which does not
+  // depend on one channel surviving for minutes.
   chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
     state.messages++;
     var from = describeSender(sender);
@@ -393,43 +539,10 @@ importScripts(
     }
 
     if (type === MSG_TRANSLATE) {
-      log.debug('recv ' + messaging.summarizeMessage(msg) + ' from ' + from);
-      if (ns.logger.isVerbose()) messaging.warnUnserializable(msg, 'MSG_TRANSLATE');
-      state.lastRequest = { id: requestId, at: Date.now(), from: from, summary: messaging.summarizeMessage(msg) };
-
-      var running;
-      try {
-        running = Promise.resolve(translateBatch(msg.batch, {
-          requestId: requestId,
-          profileName: msg.profileName || msg.profile,
-          concurrency: msg.concurrency,
-          timeoutMs: msg.timeoutMs,
-          strategy: msg.strategy,
-          request: msg.request,
-          cache: msg.cache,
-          rawSummary: messaging.summarizeMessage(msg)
-        }));
-      } catch (syncErr) {
-        running = Promise.reject(syncErr); // e.g. an unknown profile name
-      }
-
-      running.then(function (res) {
-        reply(sendResponse, res, tag);
-      }, function (err) {
-        var message = String((err && err.message) || err);
-        log.error(tag + ' translateBatch THREW ' + message +
-          ' stack=' + String((err && err.stack) || '').split('\n').slice(0, 4).join(' | '));
-        reply(sendResponse, {
-          requestId: requestId,
-          status: 'failure',
-          error: message,
-          errorType: 'internal',
-          segments: (msg.batch && msg.batch.segments && msg.batch.segments.length) || 0,
-          estimatedTokens: (msg.batch && msg.batch.estimatedTokens) || 0,
-          results: {}, translated: 0, failed: (msg.batch && msg.batch.segments && msg.batch.segments.length) || 0,
-          cacheHits: 0, elapsedMs: 0
-        }, tag);
-      });
+      // Supported for compatibility (a page whose connect() failed, an older
+      // build), but such a request is one worker recycling away from being lost.
+      log.debug(tag + ' arrived over sendMessage; the "' + C.PORT_TRANSLATE + '" port is the durable channel');
+      runTranslate(msg, function (payload, t) { reply(sendResponse, payload, t); }, tag, from);
       return true; // asynchronous response
     }
 
@@ -468,6 +581,10 @@ importScripts(
       startedAt: state.startedAt, messages: state.messages, batches: state.batches,
       requests: state.requests, translated: state.translated, failed: state.failed,
       cacheHits: state.cacheHits, lastRequest: state.lastRequest,
+      // The ceiling every per-request timeout is clamped to (see constants): a
+      // batch that needs more than this has to be packed smaller.
+      requestTimeoutCapMs: C.MAX_REQUEST_TIMEOUT_MS,
+      batchCaps: C.BATCH_SETTINGS,
       recentBatches: state.recentBatches.slice(-8)
     }, semaphoreSnapshot());
   }
