@@ -316,6 +316,41 @@ ok('one-letter fragment dropped', !isCollected(findNode('a')));
 ok('digit-only fragment dropped', !isCollected(findNode('12345')));
 ok('whitespace-only node dropped', !isCollected(findNode('  ')));
 
+console.log('== extractor: screen-reader text never becomes a segment ==');
+// .sr-only (Tailwind) and .visually-hidden (Bootstrap) hide text with CSS: it
+// is never read with eyes, it is what answered `identical` on a real page, and
+// translating it costs tokens for nothing. A detached subtree keeps every
+// count-sensitive assertion above untouched.
+(function () {
+  const srBox = E('div', { class: 'card' },
+    E('span', { class: 'sr-only' }, 'Jump to main content'),
+    E('div', { class: 'visuallyhidden' }, E('span', {}, 'Trending icon label')),
+    E('p', { class: 'body' }, 'Visible paragraph text stays'));
+  const gotSr = extractor.collect(srBox);
+  ok('sr-only / visually-hidden text is not collected',
+    gotSr.visible.length === 1 && gotSr.visible[0].nodeValue === 'Visible paragraph text stays',
+    gotSr.visible.map((n) => n.nodeValue));
+  const sA = extractor.scanStats();
+  ok('the a11y skips are counted apart', sA.skippedA11y === 2 && sA.skippedText >= 2, sA);
+  ok('invisible text is not deferred either', gotSr.hidden.length === 0, gotSr.hidden.length);
+})();
+
+console.log('== extractor: a long paragraph is kept, or refused LOUDLY ==');
+// maxTextLength used to be 5000, which silently threw away long article
+// paragraphs - the left-behind English of the field reports.
+(function () {
+  const midBox = E('div', {}, E('div', { class: 'prose' }, E('p', {}, 'x '.repeat(3000)))); // 6000 chars
+  const gotMid = extractor.collect(midBox);
+  ok('a 6000-char paragraph is collected (the old 5000 cap dropped it)',
+    gotMid.visible.length === 1, extractor.scanStats());
+  const bigBox = E('div', { id: 'huge' }, E('div', { class: 'prose' }, E('p', {}, 'y '.repeat(7000)))); // 14000 chars
+  const gotBig = extractor.collect(bigBox, { maxTextLength: 12000 });
+  const sL = extractor.scanStats();
+  ok('over the cap the node is refused AND counted', sL.tooLong === 1 && gotBig.visible.length === 0, sL);
+  const bigNode = bigBox.querySelectorAll('p')[0].firstChild;
+  ok('and the refusal answers why', extractor.textSkipReason(bigNode, { maxTextLength: 12000 }) === 'long');
+})();
+
 console.log('== segmenter: one segment per text node ==');
 const segs = segmenter.buildSegments(documentMock);
 ok('every segment carries a Text node reference', segs.length > 0 && segs.every((s) => s.source && s.source.node && s.source.node.nodeType === 3));
@@ -582,12 +617,20 @@ const bg = { requests: 0, sent: [] }; // the fake worker: what it was asked to t
 function answerTranslate(msg, respond) {
   const wire = (msg && msg.batch && msg.batch.segments) || [];
   const results = {};
+  // An echo-retry request identifies itself by the explicit instruction the
+  // page adds (content.js: ECHO_RETRY_PROMPT as request.batchSystemPrompt).
+  const strict = !!(msg.request && msg.request.batchSystemPrompt);
+  (bg.prompts = bg.prompts || []).push(strict ? 'strict' : 'plain');
   wire.forEach((s) => {
     bg.requests++;
     bg.sent.push(s.text);
+    // bg.echo lists the texts this fake server answers with a copy of the
+    // English (the model echoing); echoHard keeps echoing even when asked.
+    let out = 'ヒミツノモジ';
+    if (bg.echo && bg.echo.has(s.text) && (!strict || bg.echoHard)) out = s.text;
     // A translation with no Latin letters in it, so the page's own "is this
     // English?" rule refuses to collect it a second time.
-    results[s.id] = { text: s.text, translatedText: 'ヒミツノモジ' };
+    results[s.id] = { text: s.text, translatedText: out };
   });
   setTimeout(() => respond({
     requestId: msg.id, status: 'success', results, translated: wire.length, failed: 0,
@@ -752,6 +795,47 @@ const putSettings = (patch) => sandbox.chrome.storage.local.set(patch);
     [api.getState().waitingForDisplay, renderer.appliedCount(), first.texts[0].nodeValue]);
   await sleep(30); // give the fallback poll a chance to show any stray request
   ok('the watcher is quiet once nothing is waiting', api.getDeferred().watching === false, api.getDeferred());
+
+  // --- the model copying the English ------------------------------------------
+  // An `identical` answer used to be cached as a success and never asked about
+  // again: the text stayed English forever. Now it gets exactly ONE more
+  // chance, as a small request carrying an explicit do-not-copy instruction.
+  console.log('== echo retry: a copied answer gets one honest second chance ==');
+  const echoBox = E('div', { class: 'echo-zone' },
+    E('p', {}, 'Copy me not please'), E('p', {}, 'Echo me you say'));
+  mainEl.appendChild(echoBox);
+  const echoNodes = echoBox.querySelectorAll('p').map((p) => p.firstChild);
+  bg.echo = new Set(['Copy me not please', 'Echo me you say']);
+  bg.echoHard = false;
+  const runA = await api.translatePage(echoBox);
+  ok('both paragraphs copied on the first try', runA.skipCounts.identical === 2, runA.skipCounts);
+  ok('the strict retry followed the plain request',
+    bg.prompts.slice(-2).join(',') === 'plain,strict', bg.prompts.slice(-3));
+  ok('the retry translated and wrote both', echoNodes.every((n) => jp(n.nodeValue)) && runA.applied === 2,
+    echoNodes.map((n) => n.nodeValue));
+  ok('the retry round is counted in the summary', runA.echoRetried === 2, runA.echoRetried);
+  ok('a translated-after-retry segment counts as translated once, not twice',
+    runA.translated === 2, runA.translated);
+
+  // A server that will not translate this one no matter what: it stays English,
+  // is tried exactly twice, and above all the copy must never enter the session
+  // cache, or every later run serves the English as a translation.
+  const stubborn = E('p', {}, 'Stubborn wording here');
+  echoBox.appendChild(stubborn);
+  const entriesBefore = api.getCache().entries;
+  bg.echo = new Set(['Stubborn wording here']);
+  bg.echoHard = true;
+  const runB = await api.translatePage(echoBox);
+  const stubbornNode = stubborn.firstChild;
+  ok('a stubborn copy stays in English', !jp(stubbornNode.nodeValue) &&
+    stubbornNode.nodeValue === 'Stubborn wording here', stubbornNode.nodeValue);
+  ok('it was tried exactly twice', bg.sent.filter((t) => t === 'Stubborn wording here').length === 2,
+    bg.sent.filter((t) => t === 'Stubborn wording here').length);
+  ok('a copy never enters the session cache', api.getCache().entries === entriesBefore,
+    [entriesBefore, api.getCache().entries]);
+  ok('a copy does not count as translated', runB.translated === 0, runB.translated);
+  bg.echo = null;
+  bg.echoHard = false;
 
 })().then(finish, function (err) {
   fail++;

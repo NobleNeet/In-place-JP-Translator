@@ -112,8 +112,16 @@
     },
 
     // Extraction unit is a Text node (never an element): see content/extractor.js.
-    // minTextLength drops "a", "»", "2" fragments the model would only mangle;
-    // maxTextLength keeps one huge <p> from starving a batch of its token budget.
-    EXTRACT: { minTextLength: 3, maxTextLength: 5000 }
+    // minTextLength drops "a", "»", "2" fragments the model would only mangle.
+    // maxTextLength used to be 5000, which silently threw away long article
+    // paragraphs - a left-behind block of English nobody could explain. The
+    // packer already gives an oversized node a request of its own (see
+    // translation/batcher.js), so the cap only needs to keep pathological nodes
+    // (a whole page inside one text node) out of one prompt; anything it does
+    // refuse is counted in scanStats().tooLong, never dropped in silence.
+    // Raise it if the server decodes fast enough for one node to answer inside
+    // MAX_REQUEST_TIMEOUT_MS. Screen-reader-only text (.sr-only and friends) is
+    // skipped outright: invisible text the user cannot read.
+    EXTRACT: { minTextLength: 3, maxTextLength: 12000 }
   };
 })();

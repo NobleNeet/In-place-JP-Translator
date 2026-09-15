@@ -199,6 +199,7 @@ You can also inspect live state from the console:
 ```js
 window.__plamo.getState()      // { phase, segments, translated, failed, applied, skipped, skipCounts, ... }
 window.__plamo.getPending()    // what the extractor/segmenter found, before anything is sent
+window.__plamo.getUntranslated()// what is STILL English: { count, sample { path, text, cached }, scan, segmentSkipped, deferredHidden }
 window.__plamo.getApplied(20)  // one row per text node we rewrote: { path, before, after }
 window.__plamo.scanStats()     // elements walked, skipped subtrees, refused text nodes
 window.__plamo.restoreText(n)  // put one text node back (n from getApplied/getPending)
@@ -371,6 +372,27 @@ translate at once* in the popup (it applies to the next "Translate Page" press).
 The knobs live under `priority` in `chrome.storage.local` — `deferHidden`,
 `revealDebounceMs`, `revealIntervalMs`, `maxHiddenChecks` — with defaults in
 `PRIORITY_SETTINGS` in `shared/constants.js`.
+
+### When a paragraph stays in English
+
+`__plamo.getUntranslated()` answers "why is this paragraph still English?" in
+one look: it lists the visible text a fresh run would send and has never
+written, and the `scan` / `segmentSkipped` numbers say what never became a
+segment at all. The three things that can leave text behind:
+
+- **The model copied the English** (log: `not written [identical]`). A copy is
+  not a translation: it is never cached, and each copied segment gets exactly
+  one more request at the end of the run — a small batch carrying an explicit
+  do-not-copy system instruction (log: `echo#N`). Still copied after that, it
+  stays English and says so; no endless retry loop.
+- **A paragraph longer than `EXTRACT.maxTextLength`** (default 12 000 chars) is
+  refused — but never silently: `extract: N text node(s) exceed...` names them
+  in the console and `scanStats().tooLong` counts them. Raise the cap if your
+  server answers a single huge node inside the request timeout; the packer
+  already gives an oversized node a request of its own.
+- **Screen-reader text** (`.sr-only`, `.visually-hidden`, ...) is invisible by
+  design, so it is never extracted, never deferred, never a request — that is
+  also where most of the `[identical]` noise on real pages came from.
 
 ---
 

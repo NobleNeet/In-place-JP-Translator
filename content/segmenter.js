@@ -15,12 +15,13 @@
 //     the user cannot see are left out of the list entirely — they cost no
 //     request until they are displayed. The caller keeps them for its own
 //     "did it appear yet?" watch; see content/content.js.
-// The text of a paragraph that does not fit one segment is cut into several
-// segments, because a segment is also the unit that gets *written back*: a piece
-// that arrives longer than what left is refused by the renderer and its words
-// would be lost. The cut happens per text node and only where cutting costs
-// nothing, so the pieces come back in the same order they left and the renderer
-// puts them side by side again (see content/renderer.js).
+// A paragraph that is ONE huge text node is not cut into pieces: the text node
+// is also the unit that gets *written back*, and there is no piece machinery.
+// What actually happens with a long paragraph: the extractor keeps it (up to a
+// generous EXTRACT.maxTextLength) and the packer gives it a request of its own
+// (translation/batcher.js splits oversized units out); a node above even that
+// cap is refused by the extractor and reported loudly there, never silently.
+// Whatever stayed in English is listed by __plamo.getUntranslated().
 (function () {
   var ns = globalThis.__PLAMO__;
   var log = ns.logger.log;

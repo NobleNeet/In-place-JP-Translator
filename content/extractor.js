@@ -20,8 +20,10 @@
 // modal and a mobile header are all copies of text nobody is reading, and each is
 // translated when it is displayed rather than up front. The rules for hidden text
 // and for the article/menu/heading ordering live in content/priority.js; this file
-// only splits, it never throws away. extractTextNodes(root) returns the visible
-// part only.
+// splits first and throws away only what no request could carry (a node over
+// EXTRACT.maxTextLength, screen-reader text) - and it reports every refusal in
+// scanStats()/the console, never silently. extractTextNodes(root) returns the
+// visible part only.
 //
 // Exports: collect, extractTextNodes, extractTextNodesSplit, shouldIgnore,
 //          isTranslatableText, scanStats
@@ -46,6 +48,36 @@
     'no-translate', 'no-translate-block', 'no-translate-children', 'notranslate',
     'plamo-ui', 'plamo-translated'
   ]);
+
+  // Screen-reader text: CSS hides it (.sr-only in Tailwind, .visually-hidden in
+  // Bootstrap and friends), only a reader using assistive technology ever sees
+  // it. It is not text anybody reads with their eyes, so translating it costs
+  // tokens for nothing - and short link/icon labels are exactly what a model
+  // answers with a copy of the English, which is where the `identical` console
+  // noise on real pages came from. It is skipped outright: not sent, not even
+  // deferred. Checked per node (not subtree-rejected) because an .sr-only span
+  // is usually a sibling of real text, and climbing one class above the text
+  // node's parent still catches <div class="sr-only"><span>text</span></div>.
+  var VISUALLY_HIDDEN_CLASS = new Set([
+    'sr-only', 'visually-hidden', 'visuallyhidden', 'screen-reader-text',
+    'screen-reader-only', 'a11y-hidden'
+  ]);
+
+  function isVisuallyHiddenText(node) {
+    var el = node.parentNode;
+    var guard = 0;
+    while (el && el.nodeType === 1 && guard++ < 3) {
+      var cls = classString(el);
+      if (cls) {
+        var names = cls.split(/\s+/);
+        for (var i = 0; i < names.length; i++) {
+          if (VISUALLY_HIDDEN_CLASS.has(names[i])) return true;
+        }
+      }
+      el = el.parentNode;
+    }
+    return false;
+  }
 
   // Letters of any script: drops nodes that are only punctuation/digits, which
   // a translation model answers with an unrelated completion.
@@ -114,19 +146,43 @@
     return { min: min, max: max };
   }
 
-  function isTranslatableText(node, limits) {
+  // null = collect it; a string = the one reason it was refused. Answering
+  // *why* matters: a paragraph left in English because it was over the length
+  // cap used to be indistinguishable from one nobody ever scanned.
+  function textSkipReason(node, limits) {
     var value = node.nodeValue;
-    if (typeof value !== 'string' || !value) return false;
+    if (typeof value !== 'string' || !value) return 'empty';
     var trimmed = value.trim();
-    if (trimmed.length < limits.min) return false;
-    if (trimmed.length > limits.max) return false;
-    if (!LETTER_RE.test(trimmed)) return false;
-    if (/[\r\n]/.test(value) && preservesWhitespace(node.parentNode)) return false;
-    return true;
+    if (trimmed.length < limits.min) return 'short';
+    if (trimmed.length > limits.max) return 'long';
+    if (!LETTER_RE.test(trimmed)) return 'no-letters';
+    if (/[\r\n]/.test(value) && preservesWhitespace(node.parentNode)) return 'pre';
+    return null;
+  }
+
+  function isTranslatableText(node, limits) { return textSkipReason(node, limits) === null; }
+
+  // A refused-too-long node gets a short address in the log (tag#id.first-class
+  // chain, a few steps up), because "1 node was too long" is not actionable.
+  function longNodeAddress(el) {
+    var out = [];
+    var node = el;
+    var guard = 0;
+    while (node && node.nodeType === 1 && guard++ < 4) {
+      var tag = String(node.tagName || '').toLowerCase();
+      if (node.id) tag += '#' + node.id;
+      else {
+        var cls = classString(node).trim().split(/\s+/)[0];
+        if (cls) tag += '.' + cls;
+      }
+      out.unshift(tag);
+      node = node.parentNode;
+    }
+    return out.join(' > ');
   }
 
   var lastScan = { root: null, elements: 0, skippedSubtrees: 0, textNodes: 0, skippedText: 0,
-    hiddenText: 0, styleLookups: 0, at: 0 };
+    skippedA11y: 0, tooLong: 0, hiddenText: 0, styleLookups: 0, at: 0 };
 
   // ns.priority, with a loud warning when it is missing: load order in
   // manifest.json decides this, and a silent "everything is visible" answer is
@@ -166,14 +222,28 @@
     var prio = priorityModule();
     var vis = prio ? prio.createVisibility(root, opts && opts.visibility) : null;
     lastScan = { root: (root.nodeType === 9) ? 'document' : tagNameOf(root), elements: 0,
-      skippedSubtrees: 0, textNodes: 0, skippedText: 0, hiddenText: 0, styleLookups: 0, at: Date.now() };
+      skippedSubtrees: 0, textNodes: 0, skippedText: 0, skippedA11y: 0, tooLong: 0,
+      hiddenText: 0, styleLookups: 0, at: Date.now() };
+    var longNotes = [];
     var walker;
     try {
       walker = doc.createTreeWalker(root, NF.SHOW_ELEMENT | NF.SHOW_TEXT, {
         acceptNode: function (node) {
           if (node.nodeType === TEXT_NODE) {
             lastScan.textNodes++;
-            if (!isTranslatableText(node, limits)) { lastScan.skippedText++; return NF.FILTER_SKIP; }
+            if (isVisuallyHiddenText(node)) { lastScan.skippedText++; lastScan.skippedA11y++; return NF.FILTER_SKIP; }
+            var reason = textSkipReason(node, limits);
+            if (reason) {
+              lastScan.skippedText++;
+              if (reason === 'long') {
+                lastScan.tooLong++;
+                if (longNotes.length < 4) {
+                  longNotes.push(longNodeAddress(node.parentNode) + ' ' +
+                    String(node.nodeValue || '').trim().length + ' chars');
+                }
+              }
+              return NF.FILTER_SKIP;
+            }
             return NF.FILTER_ACCEPT;
           }
           if (node !== root && shouldIgnore(node)) { skippedSubtrees++; return NF.FILTER_REJECT; }
@@ -202,7 +272,17 @@
     log.debug('extract: ' + visible.length + ' visible + ' + hidden.length + ' hidden text node(s) under ' +
       lastScan.root + ' (elements=' + lastScan.elements + ' skipped-subtrees=' + skippedSubtrees +
       ' text-nodes=' + lastScan.textNodes + ' skipped-text=' + lastScan.skippedText +
+      ' a11y-hidden=' + lastScan.skippedA11y + ' too-long=' + lastScan.tooLong +
       ' css-lookups=' + lastScan.styleLookups + ')');
+    // A paragraph over the length cap stays in English until the cap is raised;
+    // saying so loudly is the entire difference between a diagnosable page and
+    // a mysterious "a few paragraphs were left behind" report.
+    if (lastScan.tooLong) {
+      log.warn('extract: ' + lastScan.tooLong + ' text node(s) exceed EXTRACT.maxTextLength (' +
+        limits.max + ' chars) and are LEFT UNTRANSLATED: ' + longNotes.join(' | ') +
+        (lastScan.tooLong > longNotes.length ? ' ...' : '') +
+        ' (raise EXTRACT.maxTextLength in shared/constants.js, or split the node; __plamo.getUntranslated() lists what stayed in English)');
+    }
     return { visible: visible, hidden: hidden };
   }
 
@@ -222,9 +302,11 @@
     collectTextNodes: extractTextNodes,
     shouldIgnore: shouldIgnore,
     isTranslatableText: function (node, opts) { return isTranslatableText(node, bounds(opts)); },
+    textSkipReason: function (node, opts) { return textSkipReason(node, bounds(opts)); },
     scanStats: scanStats,
     SKIP_TAGS: SKIP_TAGS,
-    SKIP_CLASS: SKIP_CLASS
+    SKIP_CLASS: SKIP_CLASS,
+    VISUALLY_HIDDEN_CLASS: VISUALLY_HIDDEN_CLASS
   };
 })();
 

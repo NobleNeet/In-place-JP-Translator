@@ -11,8 +11,11 @@
 // concurrency bound = requests in flight) -> write each finished translation
 // into its own text node (node.nodeValue only) as soon as its batch arrives.
 // Because an element's children are never replaced, links/forms/images survive
-// and the layout holds. MSG_RESTORE (or __plamo.restoreAll()) puts the original
-// values back.
+// and the layout holds. A translation that is just a copy of the English
+// ('identical') is not a success: it is never cached, and at the end of the run
+// every copied segment gets one more small request with an explicit do-not-copy
+// instruction (retryEchoSegments). MSG_RESTORE (or __plamo.restoreAll()) puts
+// the original values back.
 // Text the user could not see when the page was scanned is not sent at all: it
 // is remembered and translated on its own as soon as the page displays it (see
 // the reveal watch below, and content/priority.js for what counts as hidden).
@@ -246,8 +249,16 @@
     };
   }
 
+  // echoSegments: segments the model answered with a copy of the English
+  // (renderer reason 'identical'). They get ONE more chance after the run
+  // (retryEchoSegments); retryRound says "we are in that second chance now", so
+  // a second copy is recorded as a fact instead of triggering another retry.
   function newStats() {
-    return { translated: 0, failed: 0, cacheHits: 0, applied: 0, skipped: 0, requests: 0, errorCounts: {}, skipCounts: {}, errors: [] };
+    return {
+      translated: 0, failed: 0, cacheHits: 0, applied: 0, skipped: 0, requests: 0,
+      errorCounts: {}, skipCounts: {}, errors: [],
+      echoSegments: [], retryRound: false, echoRetried: 0
+    };
   }
 
   // __plamo.getState() reports the counters of the run it is asked about, so they
@@ -286,8 +297,11 @@
   // comes from segmentsById (page side), because a DOM node cannot cross the
   // message boundary — that is why segments are sent as ids only. Each
   // translation lands in one Text node (node.nodeValue), never in an element,
-  // so the page structure survives. Successful translations are fed back into
-  // the session cache so a second run hits it.
+  // so the page structure survives. Only a translation that ACTUALLY landed
+  // goes into the session cache: caching before the write meant an 'identical'
+  // answer (the model copying the English) was cached as a success, so every
+  // later run served the copy from cache and the text was never translated
+  // again. An identical answer is instead queued for one honest retry.
   function applyBatchResults(btag, res, segmentsById, stats) {
     var ids = Object.keys((res && res.results) || {});
     var applied = 0;
@@ -302,7 +316,6 @@
       }
       if (!r.translatedText) { countError(stats, 'empty'); return; }
       var textKey = (r.text != null) ? r.text : (segmentsById[id] && segmentsById[id].text);
-      if (typeof textKey === 'string' && typeof r.translatedText === 'string') cache.set(textKey, r.translatedText);
       var seg = segmentsById[id];
       if (!seg) {
         stats.skipped++;
@@ -317,10 +330,19 @@
         return;
       }
       var out = applySegment(seg, r.translatedText);
-      if (out.ok) applied++;
+      if (out.ok) {
+        applied++;
+        if (typeof textKey === 'string' && typeof r.translatedText === 'string') cache.set(textKey, r.translatedText);
+      }
       else {
         stats.skipped++;
         countSkip(stats, out.reason || 'refused');
+        // The background counted this as translated; a copy of the English is
+        // not a translation, so take it back out of the count.
+        if (out.reason === 'identical') {
+          stats.translated = Math.max(0, stats.translated - 1);
+          if (!stats.retryRound) stats.echoSegments.push(seg);
+        }
         if (problems.length < 4) {
           problems.push('seg#' + id + ' not written [' + out.reason + '] ' + (seg.source.path || seg.source.parentTag || ''));
         }
@@ -331,6 +353,8 @@
     if (problems.length) log.warn(btag + ' ' + problems.length + ' problem(s): ' + problems.join(' | '));
     return applied;
   }
+
+
 
   // Turns one background response into counters plus log records. This is the
   // place that used to swallow every per-segment failure.
@@ -448,6 +472,82 @@
         countError(stats, 'transport');
       }
     });
+  }
+
+  var ECHO_RETRY_PROMPT =
+    'You are translating into Japanese. The previous attempt returned some of these lines ' +
+    'UNCHANGED: copying the English is a failure, not an answer. Rewrite EVERY line below ' +
+    'in natural Japanese; every answer line must contain Japanese characters.';
+
+  // The second chance for 'identical' answers: the model looked at the English
+  // and wrote it straight back. Sometimes that is the text genuinely not being
+  // worth translating (an .sr-only label - those are now filtered at extraction,
+  // see content/extractor.js), but for real prose a batched prompt can be what
+  // caused it: with 24 lines of mixed text a translation model loses the plot
+  // and copies a line. This one round goes out as small requests carrying an
+  // explicit instruction (the profiles send no instruction by default, which is
+  // right for a translation model and wrong for a model that just echoed).
+  // Still identical after this, it is recorded as a fact: no third round, and
+  // nothing is cached either way (the cache only ever holds landed text).
+  function retryEchoSegments(tag, apiSchedule, segmentsById, stats, latencies) {
+    var echoes = stats.echoSegments;
+    if (!echoes.length) return Promise.resolve();
+    stats.retryRound = true; // set NOW: an answer arriving during this round must not re-enter the queue
+    if (abortRequested) {
+      log.warn(tag + ' ' + echoes.length + ' identical segment(s) are not retried: Stop is in effect');
+      return Promise.resolve();
+    }
+    var per = (C.RECOVERY && C.RECOVERY.maxSegmentsPerRequest) || 6;
+    var maxReq = (C.RECOVERY && C.RECOVERY.maxRequests) || 12;
+    var chunks = batcher.split({ segments: echoes }, per);
+    // One retry round per run, capped like transport recovery: a server that
+    // echoes everything must not turn a run into an endless second run.
+    if (chunks.length > maxReq) {
+      log.warn(tag + ' echo retry limited to ' + maxReq + ' request(s); ' +
+        (echoes.length - maxReq * per) + ' identical segment(s) are not retried');
+      chunks = chunks.slice(0, maxReq);
+    }
+    var retried = 0;
+    chunks.forEach(function (ch) { retried += ch.segments.length; });
+    stats.echoRetried = retried;
+    log.warn(tag + ' ' + echoes.length + ' segment(s) came back as a copy of the English; retrying ' +
+      retried + ' of them as ' + chunks.length + ' small request(s) with an explicit do-not-copy instruction');
+    var chain = Promise.resolve();
+    chunks.forEach(function (chunkBatch, ci) {
+      chain = chain.then(function () {
+        if (abortRequested) return;
+        var api = apiSchedule[ci % apiSchedule.length];
+        var btag = tag + ' echo#' + (ci + 1);
+        var payload = {
+          id: messaging.makeRequestId('r' + runSeq + 'echo' + (ci + 1)),
+          type: MSG_TRANSLATE,
+          batch: messaging.toWireBatch(chunkBatch),
+          profileName: api.name,
+          concurrency: api.concurrency,
+          strategy: (settings.request && settings.request.strategy) || undefined,
+          // The one thing this round changes: the batched system prompt.
+          request: Object.assign({}, settings.request || {}, { batchSystemPrompt: ECHO_RETRY_PROMPT }),
+          cache: messaging.toWireCache(cache, chunkBatch.segments)
+        };
+        live.sent++;
+        live.inFlight++;
+        // sendMessage, not the run's port: these are small and the run is over,
+        // and a retry should not depend on the channel that carried the big one.
+        return sendRuntime(payload).then(function (res) {
+          live.inFlight--;
+          handleBatchResponse(btag, ci + 1, chunkBatch, res, segmentsById, stats, latencies);
+        }, function (err) {
+          live.inFlight--;
+          stats.failed += chunkBatch.segments.length;
+          countError(stats, 'transport');
+          pushError(stats, lastErrorMessage(err));
+          syncLive(stats);
+          log.error(btag + ' echo retry FAILED for ' + chunkBatch.segments.length + ' segment(s): ' +
+            lastErrorMessage(err) + hintFor(lastErrorMessage(err)));
+        });
+      });
+    });
+    return chain;
   }
 
   // root: the subtree to scan. opts.nodes: scan ONLY these Text nodes — the way
@@ -572,6 +672,10 @@
       });
 
       return Promise.all(promises).then(function () {
+        // Batches are all answered; identical answers get their one retry here,
+        // still inside the run so the summary below reports the real outcome.
+        return retryEchoSegments(tag, apiSchedule, segmentsById, stats, latencies);
+      }).then(function () {
         closeChannel('run#' + runId + ' finished');
         var summary = {
           total: segments.length,
@@ -590,6 +694,7 @@
           firstViewportLatencyMs: latencies.firstViewportLatencyMs,
           errorCounts: stats.errorCounts,
           skipCounts: stats.skipCounts,
+          echoRetried: stats.echoRetried,
           errors: stats.errors
         };
         setStatus('idle');
@@ -599,6 +704,7 @@
           ' applied=' + summary.applied + ' failed=' + summary.failed + ' skipped=' + summary.skipped +
           ' cacheHits=' + summary.cacheHits + ' requests=' + summary.requests +
           ' (' + summary.batches + ' request(s) for ' + summary.total + ' segment(s))' +
+          (summary.echoRetried ? ' echo-retried=' + summary.echoRetried : '') +
           ' in ' + summary.elapsedMs + 'ms' +
           ' firstTranslated=' + summary.firstTranslatedLatencyMs + 'ms cache=' + cache.map.size;
         if (summary.failed) log.warn(endLine); else log.info(endLine);
@@ -609,7 +715,9 @@
         if (Object.keys(stats.skipCounts).length) {
           log.warn(tag + ' translated but not written ' + JSON.stringify(stats.skipCounts) +
             ' :: "changed-after-extract" means the page re-rendered that node ' +
-            '(SPA); see __plamo.getApplied() for what did land');
+            '(SPA); "identical" means the model copied the English, retried once ' +
+            '(see the echo#N lines); see __plamo.getApplied() for what did land and ' +
+            '__plamo.getUntranslated() for what is still in English');
         }
         return summary;
       });
@@ -805,6 +913,38 @@
           estimatedTokens: b.estimatedTokens,
           roles: ns.priority ? ns.priority.histogram(b.segments) : null,
           sample: b.segments.slice(0, 3).map(function (s) { return (s.role || '?') + ':' + s.text.slice(0, 32); })
+        };
+      })
+    };
+  }
+
+  // "Some paragraphs are still English" in one answer: scan the page NOW and
+  // list the visible English text a fresh run would send and has never written.
+  // Text we rewrote is not here; hidden text is reported apart (it waits on
+  // purpose); text the extractor refused for size shows up in scan.tooLong, and
+  // __plamo.getSegmentStats().skipped says what the segmenter dropped.
+  function getUntranslated(opts) {
+    var root = (opts && opts.root) || document;
+    var built = collectSegments(root, null);
+    var missing = built.segments.filter(function (s) {
+      return s.source && s.source.node && !renderer.isApplied(s.source.node);
+    });
+    var scan = ns.extractor.scanStats();
+    return {
+      count: missing.length,
+      alreadyApplied: built.segments.length - missing.length,
+      // Not missing: held back until displayed, the reveal watch translates it.
+      deferredHidden: built.stats.deferred,
+      waitingForDisplay: deferredNodes.length,
+      // scan.tooLong / segmentSkipped: text never became a segment at all.
+      scan: scan,
+      segmentSkipped: built.stats.skipped,
+      sample: missing.slice(0, (opts && opts.limit) || 15).map(function (s) {
+        return {
+          id: s.id, role: s.role, viewport: s.viewport, chars: s.text.length,
+          path: (s.source && s.source.path) || '',
+          cached: cache.map.has(s.text),
+          text: s.text.slice(0, 80)
         };
       })
     };
@@ -1076,6 +1216,9 @@
     // diagnostics
     getState: getState,
     getPending: getPending,
+    // "what is still English and why": visible text a fresh run would send that
+    // we never wrote, plus what the scan refused (see getSegmentStats).
+    getUntranslated: getUntranslated,
     // How the next run would be packed into API requests (no request is sent).
     getBatchPlan: getBatchPlan,
     // The caps the packer in use was built with: proves a saved setting landed.
@@ -1131,7 +1274,7 @@
     ' (send order ' + ((C.PRIORITY_ROLES || []).join(' > ') || 'viewport only') +
     ', deferHidden=' + prio0.deferHidden + ', re-check hidden text ' + prio0.revealDebounceMs +
     'ms after a style change and every ' + prio0.revealIntervalMs + 'ms)');
-  log.info('diagnostics: __plamo.getState(), __plamo.getPending(), __plamo.getDeferred(), ' +
-    '__plamo.getBatchPlan(), __plamo.dumpLogs(), __plamo.pingBackground()');
+  log.info('diagnostics: __plamo.getState(), __plamo.getPending(), __plamo.getUntranslated(), ' +
+    '__plamo.getDeferred(), __plamo.getBatchPlan(), __plamo.dumpLogs(), __plamo.pingBackground()');
   setStatus('idle');
 })();
