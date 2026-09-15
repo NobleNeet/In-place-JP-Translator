@@ -10,6 +10,13 @@
       profileName: C.DEFAULT_PROFILE,
       mode: C.DEFAULT_MODE,
       maxConcurrent: C.DEFAULT_MAX_CONCURRENT,
+      // Per-API tuning, keyed by profile name (api/profiles.js): one entry per
+      // server you want in the run, each with its own `enabled` switch and
+      // `concurrency` (null = inherit the shared maxConcurrent). Several
+      // enabled entries mean the run sends its batches through all of those
+      // servers at once. Empty (every install saved before this existed) keeps
+      // the old behaviour: profileName alone, at maxConcurrent.
+      apis: {},
       batch: {
         maxSegmentsPerBatch: C.BATCH_SETTINGS.maxSegmentsPerBatch,
         maxEstimatedTokensPerBatch: C.BATCH_SETTINGS.maxEstimatedTokensPerBatch,
@@ -41,6 +48,7 @@
     var maxConcurrent = clampConcurrent(patch.maxConcurrent);
     return Object.assign({}, base, patch, {
       maxConcurrent: maxConcurrent,
+      apis: normalizeApis(patch.apis),
       batch: Object.assign({}, base.batch, (patch.batch || {})),
       priority: Object.assign({}, base.priority, (patch.priority || {}), {
         // The numbers are clamped, not trusted: a stored typo must not turn the
@@ -66,6 +74,55 @@
     if (Number.isNaN(n)) return C.DEFAULT_MAX_CONCURRENT;
     if (C.CONCUR_OPTIONS.indexOf(n) !== -1) return n;
     return C.CONCUR_OPTIONS.filter(function (c) { return c >= n; })[0] || C.CONCUR_OPTIONS[C.CONCUR_OPTIONS.length - 1];
+  }
+
+  // Stored per-API entries are trusted no further than the numbers already
+  // are: `enabled` becomes a real boolean, and `concurrency` is either a legal
+  // option or null, which means "inherit settings.maxConcurrent".
+  function normalizeApis(raw) {
+    var out = {};
+    Object.keys(raw || {}).forEach(function (name) {
+      var e = raw[name] || {};
+      var n = parseInt(e.concurrency, 10);
+      out[name] = {
+        enabled: !!e.enabled,
+        concurrency: (Number.isFinite(n) && n >= 1) ? clampConcurrent(n) : null
+      };
+    });
+    return out;
+  }
+
+  // The APIs one run sends to: every enabled entry, in saved order, each with
+  // its own concurrency. Nothing enabled (a fresh install, settings saved
+  // before per-API tuning existed, or a popup that ticked everything off)
+  // keeps the old single-profile behaviour: profileName alone, at
+  // maxConcurrent.
+  function activeApis(settings) {
+    var maxConcurrent = clampConcurrent(settings && settings.maxConcurrent);
+    var apis = (settings && settings.apis) || {};
+    var out = [];
+    Object.keys(apis).forEach(function (name) {
+      var e = apis[name];
+      if (e && e.enabled) out.push({ name: name, concurrency: e.concurrency || maxConcurrent });
+    });
+    if (!out.length) {
+      out.push({ name: (settings && settings.profileName) || C.DEFAULT_PROFILE, concurrency: maxConcurrent });
+    }
+    return out;
+  }
+
+  // Which API one batch goes to: round-robin over a schedule where each API
+  // appears once per concurrency slot it can fill, so its share of the
+  // requests matches its share of the in-flight load (evo at 2 + local at 4
+  // hands two thirds of the batches to local). One API alone reproduces the
+  // old behaviour exactly; the send ORDER of batches never changes, only
+  // their destination does.
+  function apiPlan(settings) {
+    var plan = [];
+    activeApis(settings).forEach(function (api) {
+      for (var i = 0; i < api.concurrency; i++) plan.push({ name: api.name, concurrency: api.concurrency });
+    });
+    return plan;
   }
 
   // Only the two strategies that exist: an unknown/absent stored value falls
@@ -101,6 +158,9 @@
     loadSettings: loadSettings,
     saveSettings: saveSettings,
     clampConcurrent: clampConcurrent,
+    normalizeApis: normalizeApis,
+    activeApis: activeApis,
+    apiPlan: apiPlan,
     clampStrategy: clampStrategy,
     clampMs: clampMs,
     booleanWith: booleanWith,

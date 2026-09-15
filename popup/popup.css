@@ -79,6 +79,40 @@ hr {
   font-weight: 600;
 }
 
+/* API server rows: tick box + name on the left, its own concurrency on the
+   right (popup.js builds one .api-row per profile in api/profiles.js) */
+.api-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.api-row:last-child {
+  margin-bottom: 0;
+}
+
+.api-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1;
+  min-width: 0;
+  font-size: 13px;
+  margin: 0;
+  color: #1a1a1a;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.api-row select {
+  width: 72px;
+  flex: none;
+  margin-top: 0;
+}
+
 /* diagnostics hints (popup.js writes #lastError with class="hint error") */
 .hint {
   font-size: 12px;

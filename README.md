@@ -37,7 +37,7 @@ plamo-page-translator/
 ├── translation/
 │   ├── queue.js             # ordered queue
 │   ├── batcher.js           # packs DOM blocks into API requests (count + token caps)
-│   ├── scheduler.js         # concurrency semaphore
+│   ├── scheduler.js         # concurrency semaphore (one per API profile)
 │   └── cache.js             # session in-memory cache
 ├── shared/
 │   ├── logger.js            # toggleable console logging
@@ -107,8 +107,33 @@ Every request is logged as
 `request <profile> POST <resolved url> model=... kind=... chars=...`, so a wrong
 URL is visible immediately in the console.
 
-Settings you change in the popup (profile, mode, concurrency, segments per
-request, request packing) are persisted in `chrome.storage.local`.
+### Using several APIs at the same time
+
+The popup lists every profile as a row with a tick box and its own concurrency
+select. Tick several and one "Translate Page" run sends its batches through
+**all of the ticked servers in parallel**:
+
+- Each API has **its own request limiter** in the worker (`background/background.js`
+  keeps one semaphore per profile), so its concurrency is set independently —
+  a strong box at 4 next to a small one at 1 works as expected.
+- Batches are distributed by a **weighted round-robin** (`apiPlan()` in
+  `shared/settings.js`): an API appears in the schedule once per concurrency
+  slot it can fill, so its share of the requests matches its share of the
+  in-flight load (evo at 2 + local at 4 → two thirds of the batches go to
+  local). The send **order** never changes (article body first), only the
+  server a batch lands on.
+- Saved under `apis` in `chrome.storage.local`, keyed by profile name:
+  `{ "evo-x2-plamo2": { "enabled": true, "concurrency": 2 }, ... }`. No
+  entries (every install saved before this existed) keeps the old
+  single-profile behaviour: `profileName` alone, at `maxConcurrent`.
+- What a run would use: `__plamo.getApiPlan()` on the page; per-server limiter
+  numbers: `__PLAMO__.background.snapshot().apis` in the worker.
+
+There is **no failover between servers yet**: if one ticked API is down, only
+its share of the batches fails — the others keep translating.
+
+Settings you change in the popup (API servers and their concurrency, mode,
+segments per request, request packing) are persisted in `chrome.storage.local`.
 
 ---
 
@@ -139,7 +164,8 @@ Phase 1 does **not** translate automatically. Start it manually:
 1. Open an English web page.
 2. Click the PLaMo 2 Translator icon.
 3. Click **Translate Page**.
-4. (Optionally change the API profile / concurrency in the popup first.)
+4. (Optionally tick the API servers to use — several at once are supported —
+   and set each one's concurrency in the popup first.)
 5. To stop, click **Stop Translation**.
 
 ---
@@ -223,10 +249,12 @@ it exits non-zero when `m` is not 0.
 
 All of these are in the popup and apply to the **next** "Translate Page" press.
 
-- **Concurrent requests** (1 / 2 / 4 / 8, default 2): how many requests may be
-  in flight at once, enforced by a semaphore (`translation/scheduler.js`). With
-  multi-segment packing a slot is a whole *request*, so this limits requests,
-  not text nodes.
+- **API servers** — one row per profile (`api/profiles.js`): tick it to use
+  that server, and set **its own** max concurrent requests (1 / 2 / 4 / 8).
+  Each ticked server gets a separate semaphore (`translation/scheduler.js`) in
+  the worker, and its share of the batches is proportional to its concurrency
+  (see *Using several APIs at the same time* above). With one server ticked
+  this behaves exactly like the old single "Max concurrent requests" setting.
 - **Segments per request** (default 24): how many text nodes one request
   carries. A batch is also capped by estimated tokens (900), so long prose
   produces smaller batches on its own. The **first** batch is deliberately
@@ -350,7 +378,9 @@ The knobs live under `priority` in `chrome.storage.local` — `deferHidden`,
 
 - [x] Manifest V3 (Vivaldi/Chromium, classic scripts, no build step)
 - [x] Manual "Translate Page" start from the popup
-- [x] Single API profile (`single` mode)
+- [x] Multiple API profiles at once: batches split over every ticked server by
+      weighted round-robin, each with its own concurrency limiter (single
+      profile still works, and is the default)
 - [x] OpenAI-compatible `/v1/chat/completions` client (separated layer)
 - [x] Readable-block DOM extraction with proper exclusions
 - [x] Segment with unique id + stable DOM reference
@@ -380,6 +410,9 @@ The knobs live under `priority` in `chrome.storage.local` — `deferHidden`,
 ## Not yet implemented (later phases)
 
 - [ ] `fallback` / `balanced` connection modes (structure only)
+- [ ] Failover between API profiles: a server that is down should have its
+      batches re-sent through the other ticked server, instead of only failing
+      its own share
 - [ ] `IntersectionObserver` viewport streaming — the bands are measured with
       `getBoundingClientRect()` at scan time (on screen / within 400 px / rest), so
       a node that scrolls into view while a run is going keeps the band it had

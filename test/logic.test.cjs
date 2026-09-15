@@ -250,6 +250,33 @@ async function main() {
     ns.settings.clampStrategy(undefined) === ns.constants.REQUEST_SETTINGS.strategy);
   ok('clampStrategy single kept', ns.settings.clampStrategy('single') === 'single');
 
+  console.log('== several APIs at once (settings.apis) ==');
+  await chromeFake.storage.local.set({ plamo: { profileName: 'local-plamo2', maxConcurrent: 2,
+    apis: { 'evo-x2-plamo2': { enabled: true, concurrency: 1 }, 'local-plamo2': { enabled: true, concurrency: 4 },
+            ghost: { enabled: false, concurrency: 'lots' } } } });
+  const multi = await ns.settings.loadSettings();
+  ok('saved per-API entries survive loading', multi.apis['evo-x2-plamo2'].enabled === true &&
+    multi.apis['local-plamo2'].concurrency === 4, JSON.stringify(multi.apis));
+  ok('a saved typo in an API concurrency is dropped, not trusted',
+    multi.apis.ghost.enabled === false && multi.apis.ghost.concurrency === null, multi.apis.ghost);
+  const act = ns.settings.activeApis(multi);
+  ok('a run sends through every ticked API, with its own limit',
+    act.length === 2 && act[0].name === 'evo-x2-plamo2' && act[0].concurrency === 1 &&
+    act[1].name === 'local-plamo2' && act[1].concurrency === 4, JSON.stringify(act));
+  const plan = ns.settings.apiPlan(multi);
+  ok('the send schedule visits every API, roomier ones more often',
+    plan.length === 5 && plan.filter((a) => a.name === 'evo-x2-plamo2').length === 1 &&
+    plan.filter((a) => a.name === 'local-plamo2').length === 4, plan.map((a) => a.name[0]).join(''));
+  await chromeFake.storage.local.set({ plamo: { profileName: 'evo-x2-plamo2', maxConcurrent: 4 } });
+  const legacyAct = ns.settings.activeApis(await ns.settings.loadSettings());
+  ok('settings saved before per-API tuning keep the single-profile behaviour',
+    legacyAct.length === 1 && legacyAct[0].name === 'evo-x2-plamo2' && legacyAct[0].concurrency === 4,
+    JSON.stringify(legacyAct));
+  ok('ticking everything off falls back to the primary profile',
+    (() => { const o = ns.settings.activeApis({ profileName: 'local-plamo2', maxConcurrent: 2,
+      apis: { 'evo-x2-plamo2': { enabled: false } } });
+      return o.length === 1 && o[0].name === 'local-plamo2' && o[0].concurrency === 2; })());
+
   console.log('== profiles (base url + endpoint) ==');
   const evo = ns.profiles.getProfile('evo-x2-plamo2');
   const local = ns.profiles.getProfile('local-plamo2');
@@ -453,8 +480,24 @@ async function main() {
     type: ns.constants.MSG_TRANSLATE, id: 'bg-conc', profileName: 'local-plamo2',
     batch: { estimatedTokens: 1, segments: [{ id: 4, text: 'Conc', estimatedTokens: 1, viewport: 1 }] }, concurrency: 4, timeoutMs: 5000
   });
-  ok('popup concurrency retunes the shared limiter', ns.background.semaphore.getMax() === 4);
+  ok('popup concurrency retunes the API it addressed', ns.background.semaphoreFor('local-plamo2').getMax() === 4);
   ok('batch after the retune still succeeded', concCall.payload.status === 'success');
+
+  // Two servers, two limits: retuning one API's limiter must not move the
+  // other's, or "independent per-API concurrency" is a lie.
+  resetServer('ok');
+  const evoCall = await bgCall({
+    type: ns.constants.MSG_TRANSLATE, id: 'bg-evo', profileName: 'evo-x2-plamo2',
+    batch: { estimatedTokens: 1, segments: [{ id: 5, text: 'Evo', estimatedTokens: 1, viewport: 1 }] },
+    concurrency: 8, timeoutMs: 5000, cache: {}
+  });
+  ok('a batch addressed to the other API succeeds too', evoCall.payload.status === 'success' &&
+    evoCall.payload.profile === 'evo-x2-plamo2');
+  ok('each API keeps its own limiter', ns.background.semaphoreFor('evo-x2-plamo2').getMax() === 8 &&
+    ns.background.semaphoreFor('local-plamo2').getMax() === 4);
+  const snapApis = ns.background.snapshot().apis;
+  ok('the snapshot breaks the limiter down per API', !!snapApis && snapApis['evo-x2-plamo2'].limit === 8 &&
+    snapApis['local-plamo2'].limit === 4, JSON.stringify(snapApis));
 
   const pingCall = await bgCall({ type: ns.constants.MSG_PING, id: 'bg-ping' });
   ok('ping answered synchronously', pingCall.returned === false && pingCall.payload.pong === true);
@@ -586,7 +629,7 @@ async function main() {
   console.log('== content diagnostics API ==');
   const api = sandbox.window.__plamo;
   ok('window.__plamo exposed', typeof api === 'object' && api !== null);
-  ['getState', 'getPending', 'getLogs', 'dumpLogs', 'backgroundLogs', 'pingBackground', 'translatePage', 'restoreAll', 'getCache', 'getSettings', 'getBatchPlan', 'getBatcherCaps', 'getChannel', 'getRecoveryCaps', 'getSegmentStats', 'getDeferred', 'revealNow', 'forgetDeferred']
+  ['getState', 'getPending', 'getLogs', 'dumpLogs', 'backgroundLogs', 'pingBackground', 'translatePage', 'restoreAll', 'getCache', 'getSettings', 'getBatchPlan', 'getBatcherCaps', 'getChannel', 'getRecoveryCaps', 'getApiPlan', 'getSegmentStats', 'getDeferred', 'revealNow', 'forgetDeferred']
     .forEach(fn => ok('__plamo.' + fn + '()', typeof api[fn] === 'function'));
   ok('getDeferred() says what a run held back and what is still waiting',
     api.getDeferred().waiting === 0 && Array.isArray(api.getDeferred().sample), api.getDeferred());
@@ -601,6 +644,19 @@ async function main() {
     api.getBatchPlan().caps.maxSegmentsPerBatch === 8 && api.getBatchPlan().requests === 0, api.getBatchPlan());
   const stateNow = api.getState();
   ok('getState exposes counters', typeof stateNow.translated === 'number' && typeof stateNow.cache.entries === 'number');
+  await chromeFake.storage.local.set({ plamo: { profileName: 'local-plamo2', maxConcurrent: 2,
+    apis: { 'evo-x2-plamo2': { enabled: true, concurrency: 2 }, 'local-plamo2': { enabled: true, concurrency: 4 } },
+    batch: { maxSegmentsPerBatch: 8, firstBatchMaxSegments: 4 }, request: { strategy: 'single' } } });
+  await api.translatePage(); // applies the multi-API plan to the run
+  const apiState = api.getState();
+  ok('getState lists the APIs a run sends through',
+    apiState.apis && apiState.apis.length === 2 &&
+    apiState.apis.map((a) => a.name).join(',') === 'evo-x2-plamo2,local-plamo2', JSON.stringify(apiState.apis));
+  const planNow = api.getApiPlan();
+  ok('getApiPlan shows the weighted schedule', planNow.active.length === 2 && planNow.schedule.length === 6,
+    planNow.schedule.map((a) => a.name[0]).join(''));
+  ok('the batch plan names the servers a run would use',
+    Array.isArray(api.getBatchPlan().servers) && api.getBatchPlan().servers.length === 2);
   ok('ring buffer shared with the page', api.getLogs().length > 0 && api.getLogs().length === ns.logger.getLogs().length);
   const pong = await api.pingBackground();
   ok('pingBackground reaches the worker', !!pong && pong.pong === true);

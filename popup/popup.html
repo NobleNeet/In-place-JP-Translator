@@ -19,10 +19,10 @@
       <button id="stopBtn" class="btn">Stop</button>
     </div>
 
-    <label class="row">
-      <span>API profile</span>
-      <select id="profile"></select>
-    </label>
+    <div class="row">
+      <label>API servers — tick several to translate through all of them at once</label>
+      <div id="apis"></div>
+    </div>
 
     <label class="row">
       <span>Mode</span>
@@ -30,16 +30,6 @@
         <option value="single">single</option>
         <option value="fallback" disabled>fallback (coming soon)</option>
         <option value="balanced" disabled>balanced (coming soon)</option>
-      </select>
-    </label>
-
-    <label class="row">
-      <span>Max concurrent requests</span>
-      <select id="concurrency">
-        <option value="1">1</option>
-        <option value="2">2</option>
-        <option value="4">4</option>
-        <option value="8">8</option>
       </select>
     </label>
 

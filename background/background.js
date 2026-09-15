@@ -33,9 +33,21 @@ importScripts(
   var MSG_PING = C.MSG_PING;
   var MSG_DIAGNOSTICS = C.MSG_DIAGNOSTICS;
 
-  var semaphore = new ns.Semaphore(C.DEFAULT_MAX_CONCURRENT);
   var profiles = ns.profiles;
   var translateSegment = ns.openaiClient.translateSegment;
+
+  // One limiter PER API profile. A run may now use two servers at once, and
+  // each server gets its own concurrency (the roomier box keeps more requests
+  // in flight, the small one is not buried). Every name reaching translateBatch
+  // went through getProfile(), so these keys are always real profile names;
+  // creating one per profile up front also means snapshot() lists every
+  // server before its first request.
+  var semaphores = {};
+  function semaphoreFor(name) {
+    if (!semaphores[name]) semaphores[name] = new ns.Semaphore(C.DEFAULT_MAX_CONCURRENT);
+    return semaphores[name];
+  }
+  profiles.profileNames().forEach(function (name) { semaphoreFor(name); });
 
   // Aggregate counters, readable from the service-worker console:
   //   __PLAMO__.background.state
@@ -54,15 +66,28 @@ importScripts(
     return 'extension:' + (sender.extensionId || (chrome.runtime && chrome.runtime.id) || 'self');
   }
 
+  // The aggregate numbers (limit/active/pending summed over every API) plus a
+  // per-API breakdown, so ping/status/snapshot say which server is saturated.
   function semaphoreSnapshot() {
-    return { limit: semaphore.getMax(), active: semaphore.getActive(), pending: semaphore.getPending() };
+    var agg = { limit: 0, active: 0, pending: 0 };
+    var per = {};
+    Object.keys(semaphores).forEach(function (name) {
+      var s = semaphores[name];
+      var one = { limit: s.getMax(), active: s.getActive(), pending: s.getPending() };
+      agg.limit += one.limit; agg.active += one.active; agg.pending += one.pending;
+      per[name] = one;
+    });
+    agg.apis = per;
+    return agg;
   }
 
   // The popup's concurrency setting used to be ignored (the Semaphore was
-  // created once, at load time, with the default). A request may now retune the
-  // shared limiter, which is what keeps the bound global across batches.
-  function applyConcurrency(wanted, tag) {
-    var info = semaphoreSnapshot();
+  // created once, at load time, with the default). A request may now retune
+  // *its own API's* limiter, which is what keeps each server's bound stable
+  // across batches - and why two servers can sit at different limits at the
+  // same time without touching each other's queue.
+  function applyConcurrency(semaphore, wanted, tag) {
+    var info = { limit: semaphore.getMax(), active: semaphore.getActive(), pending: semaphore.getPending() };
     var n = (typeof wanted === 'number') ? wanted : parseInt(wanted, 10);
     if (!Number.isFinite(n) || n < 1) return info;
     info = semaphore.setMax(n);
@@ -120,6 +145,7 @@ importScripts(
     }
 
     var profile = profiles.getProfile(opts.profileName);
+    var semaphore = semaphoreFor(profile.name); // the batch's own API gets its own limiter
     var R = Object.assign({}, C.REQUEST_SETTINGS, opts.request || {});
     var strategy = (C.REQUEST_STRATEGIES.indexOf(opts.strategy) !== -1) ? opts.strategy : (R.strategy || C.REQUEST_SETTINGS.strategy);
     var explicitTimeout = (typeof opts.timeoutMs === 'number' && opts.timeoutMs > 0);
@@ -144,7 +170,7 @@ importScripts(
     var guardMs = timeoutMs + 5000;        // the client aborts at timeoutMs; this only fires if it never returns
     var batchGuardMs = batchTimeoutMs + 5000;
     var cache = messaging.normalizeCache(opts.cache);
-    var conc = applyConcurrency(opts.concurrency, tag);
+    var conc = applyConcurrency(semaphore, opts.concurrency, tag);
 
     log.debug(tag + ' start ' + messaging.summarizeBatch(batch) + ' | ' + profiles.describeProfile(profile) +
       ' | POST ' + profiles.resolveEndpointUrl(profile) + ' | strategy=' + strategy +
@@ -593,7 +619,8 @@ importScripts(
   // "Service Worker" -> console): __PLAMO__.background.getDiagnostics().
   ns.background = {
     state: state,
-    semaphore: semaphore,
+    semaphores: semaphores,
+    semaphoreFor: semaphoreFor,
     snapshot: snapshot,
     getLogs: function (opts) { return ns.logger.getLogs(opts); },
     dumpLogs: function (opts) { return ns.logger.dumpLogs(opts); },

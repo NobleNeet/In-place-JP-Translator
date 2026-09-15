@@ -45,6 +45,8 @@
   var createBatcher = ns.createBatcher;
   var SessionCache = ns.SessionCache;
   var loadSettings = ns.settings.loadSettings;
+  var activeApis = ns.settings.activeApis;
+  var apiPlan = ns.settings.apiPlan;
   var getProfile = ns.profiles.getProfile;
   var translateSegment = ns.openaiClient.translateSegment;
 
@@ -384,7 +386,11 @@
   // segments are re-sent as a few small requests, one after another so a page
   // whose server is struggling is not flooded. This is what keeps "a few
   // paragraphs of the page" from staying in English after one bad request.
-  function recoverBatch(btag, batchNumber, batch, segmentsById, stats, latencies) {
+  // `api` is the server the batch went to the first time: a retry goes back to
+  // the same API on purpose, because what died here was the extension's own
+  // message channel, not the server (a server that answered 500 the first time
+  // is not helped by a second server that never saw it).
+  function recoverBatch(btag, batchNumber, batch, segmentsById, stats, latencies, api) {
     var per = (C.RECOVERY && C.RECOVERY.maxSegmentsPerRequest) || 6;
     var maxReq = (C.RECOVERY && C.RECOVERY.maxRequests) || 12;
     var chunks = batcher.split(batch, per);
@@ -412,8 +418,8 @@
           id: messaging.makeRequestId(btag.replace(/\s+/g, '-') + '-retry' + (ci + 1)),
           type: MSG_TRANSLATE,
           batch: messaging.toWireBatch(chunkBatch),
-          profileName: settings.profileName,
-          concurrency: settings.maxConcurrent,
+          profileName: (api && api.name) || settings.profileName,
+          concurrency: (api && api.concurrency) || settings.maxConcurrent,
           strategy: (settings.request && settings.request.strategy) || undefined,
           request: settings.request || undefined,
           cache: messaging.toWireCache(cache, chunkBatch.segments)
@@ -463,6 +469,13 @@
       // The saved caps have to reach the packer, which was built before settings
       // were loaded (see applyBatchSettings).
       applyBatchSettings();
+      // Which APIs this run sends through. Every ticked server gets a share of
+      // the batches weighted by its own concurrency (shared/settings.js
+      // apiPlan); the send ORDER stays priority-first, only the destination of
+      // each batch alternates. One API reproduces the old single-server run.
+      var apiSchedule = apiPlan(settings);
+      live.apis = activeApis(settings);
+      live.apiSplit = {};
       // What this run sends, and what the scan held back because the user could
       // not see it. The held-back nodes are not wasted: the reveal watch below
       // translates them as soon as the page displays them.
@@ -479,6 +492,7 @@
         ' roles=' + JSON.stringify(built.roles || {}) + ' deferred=' + built.stats.deferred +
         ' deferHidden=' + built.stats.deferHidden +
         ' profile=' + settings.profileName + ' maxConcurrent=' + settings.maxConcurrent +
+        ' apis=' + live.apis.map(function (a) { return a.name + '\u00d7' + a.concurrency; }).join('+') +
         ' cache=' + cache.map.size + ' cacheHits=' + cache.hits);
       if (!segments.length) {
         setStatus('idle');
@@ -520,14 +534,19 @@
 
       var promises = batches.map(function (batch, batchIndex) {
         var btag = tag + ' batch#' + (batchIndex + 1);
+        // This batch's destination: the weighted round-robin over every ticked
+        // API. Its own concurrency rides along so the worker bounds THAT
+        // server's queue, not a global one.
+        var api = apiSchedule[batchIndex % apiSchedule.length];
+        live.apiSplit[api.name] = (live.apiSplit[api.name] || 0) + 1;
         // Only wire-safe fields cross the boundary; the cache travels as a plain
         // object limited to this batch (a Map would arrive as "{}").
         var payload = {
           id: messaging.makeRequestId('r' + runId + 'b' + (batchIndex + 1)),
           type: MSG_TRANSLATE,
           batch: messaging.toWireBatch(batch),
-          profileName: settings.profileName,
-          concurrency: settings.maxConcurrent,
+          profileName: api.name,
+          concurrency: api.concurrency,
           // No timeoutMs: a batched request answers many segments at once, so the
           // background scales the timeout with the size of the batch.
           strategy: (settings.request && settings.request.strategy) || undefined,
@@ -548,7 +567,7 @@
             hintFor(message) + ' :: ' + messaging.summarizeBatch(batch));
           // Nothing was written, so nothing is lost yet: give the segments a
           // second chance in requests small enough to answer.
-          return recoverBatch(btag, batchIndex + 1, batch, segmentsById, stats, latencies);
+          return recoverBatch(btag, batchIndex + 1, batch, segmentsById, stats, latencies, api);
         });
       });
 
@@ -564,6 +583,8 @@
           requests: stats.requests,
           batches: batches.length,
           units: unitList.length,
+          // How the run split its batches over the APIs it used.
+          apiSplit: live ? Object.assign({}, live.apiSplit) : null,
           elapsedMs: Math.round(performance.now() - t0),
           firstTranslatedLatencyMs: latencies.firstTranslatedLatencyMs,
           firstViewportLatencyMs: latencies.firstViewportLatencyMs,
@@ -705,6 +726,10 @@
       // How the last/current run talks to the worker: 'port' is the durable
       // channel, 'sendMessage' means connect() was unavailable to this page.
       channel: l.channel || (channel ? 'port' : 'sendMessage'),
+      // The APIs this run sends (or sent) through, and how the batches split
+      // over them (see __plamo.getApiPlan()).
+      apis: l.apis || null,
+      apiSplit: l.apiSplit || null,
       abortRequested: abortRequested,
       cache: { entries: cache.map.size, hits: cache.hits, misses: cache.misses },
       profile: settings.profileName || null,
@@ -765,6 +790,8 @@
       segmentsPerRequest: batches.length ? Number((segments.length / batches.length).toFixed(1)) : 0,
       caps: batcherCaps, // what the packer in use was built with
       strategy: (settings && settings.request && settings.request.strategy) || C.REQUEST_SETTINGS.strategy,
+      // Which APIs the next run would use, and with what per-API limits.
+      servers: activeApis(settings),
       viewport: countViewport(segments),
       // The order the packer sees: article body first, then headings, then page
       // chrome. `deferredHidden` is text a run would not send at all, because
@@ -1062,6 +1089,9 @@
         : { kind: 'none', name: C.PORT_TRANSLATE, requests: 0, pending: [] };
     },
     getRecoveryCaps: function () { return Object.assign({}, C.RECOVERY); },
+    // The APIs a run would send through right now (settings.apis), and the
+    // weighted round-robin schedule that decides which batch gets which server.
+    getApiPlan: function () { return { active: activeApis(settings), schedule: apiPlan(settings) }; },
     // One row per text node whose nodeValue we replaced: { path, before, after }.
     getApplied: function (limit) { return renderer.appliedSample(limit); },
     scanStats: function () { return ns.extractor.scanStats(); },

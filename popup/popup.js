@@ -83,24 +83,108 @@
     render();
   }
 
-  function populateProfiles() {
-    var sel = $('profile');
+  // One row per API profile (api/profiles.js): a tick box for "use this
+  // server" and its own concurrency select. Tick several and a run sends its
+  // batches through all of them at once — each server's requests are bounded by
+  // its own limiter in background/background.js, and its share of the batches
+  // is proportional to that concurrency (shared/settings.js apiPlan()).
+  function populateApis() {
+    var host = $('apis');
+    if (!host) return;
     profileNames().forEach(function (name) {
-      var opt = document.createElement('option');
-      opt.value = name;
-      opt.textContent = name;
-      sel.appendChild(opt);
+      var row = document.createElement('div');
+      row.className = 'api-row';
+      row.setAttribute('data-profile', name);
+
+      var label = document.createElement('label');
+      label.className = 'api-name';
+      var box = document.createElement('input');
+      box.type = 'checkbox';
+      label.appendChild(box);
+      label.appendChild(document.createTextNode(' ' + name));
+      row.appendChild(label);
+
+      var sel = document.createElement('select');
+      sel.title = 'concurrent requests for this server';
+      ns.constants.CONCUR_OPTIONS.forEach(function (n) {
+        var opt = document.createElement('option');
+        opt.value = String(n);
+        opt.textContent = String(n);
+        sel.appendChild(opt);
+      });
+      row.appendChild(sel);
+
+      box.addEventListener('change', function () { saveApis(box); });
+      sel.addEventListener('change', function () { saveApis(null); });
+      host.appendChild(row);
+    });
+  }
+
+  function apiRows() { return document.querySelectorAll('.api-row'); }
+
+  // Everything typed into the rows, keyed by profile name.
+  function readApis() {
+    var apis = {};
+    Array.prototype.forEach.call(apiRows(), function (row) {
+      var name = row.getAttribute('data-profile');
+      var box = row.querySelector('input[type="checkbox"]');
+      var sel = row.querySelector('select');
+      apis[name] = { enabled: !!box.checked, concurrency: clampConcurrent(sel.value) };
+    });
+    return apis;
+  }
+
+  // One row's change saves the whole block: settings.apis is one object, and a
+  // half-saved block would lose the other servers' limits.
+  function saveApis(toggledBox) {
+    var apis = readApis();
+    var enabled = Object.keys(apis).filter(function (name) { return apis[name].enabled; });
+    if (!enabled.length) {
+      // With no server ticked there is nothing to translate with: re-tick what
+      // the user just removed and say why, instead of saving an empty plan.
+      if (toggledBox) toggledBox.checked = true;
+      renderStatus('at least one API must be ticked');
+      return;
+    }
+    settings.apis = apis;
+    // profileName stays the primary server (the fallback plan and the console
+    // helpers read it), kept on one that is actually ticked.
+    if (enabled.indexOf(settings.profileName) === -1) settings.profileName = enabled[0];
+    saveSettings({ apis: settings.apis, profileName: settings.profileName });
+  }
+
+  // Reflect the saved settings in the rows. Nothing ticked in storage (every
+  // install saved before per-API settings existed) shows as exactly one tick —
+  // the primary profile at the old shared concurrency, which is what it has
+  // been doing all along.
+  function renderApis() {
+    var saved = settings.apis || {};
+    var anyTicked = Object.keys(saved).some(function (name) { return saved[name] && saved[name].enabled; });
+    Array.prototype.forEach.call(apiRows(), function (row) {
+      var name = row.getAttribute('data-profile');
+      var entry = saved[name];
+      var box = row.querySelector('input[type="checkbox"]');
+      var sel = row.querySelector('select');
+      box.checked = anyTicked ? !!(entry && entry.enabled) : (name === settings.profileName);
+      var conc = (entry && entry.concurrency) || settings.maxConcurrent;
+      // A saved limit that is not one of the presets (typed into storage, or an
+      // older option list) still has to show up in the select.
+      var preset = Array.prototype.some.call(sel.options, function (o) { return o.value === String(conc); });
+      if (!preset) {
+        var extra = document.createElement('option');
+        extra.value = String(conc);
+        extra.textContent = String(conc) + ' (saved)';
+        sel.appendChild(extra);
+      }
+      sel.value = String(conc);
     });
   }
 
   function init() {
-    populateProfiles();
+    populateApis();
     loadSettings().then(function (s) {
       settings = s;
-      var profileSel = $('profile');
-      if (profileSel) profileSel.value = settings.profileName;
-      var concSel = $('concurrency');
-      if (concSel) concSel.value = String(clampConcurrent(settings.maxConcurrent));
+      renderApis();
       var stratSel = $('strategy');
       if (stratSel) stratSel.value = clampStrategy(settings.request && settings.request.strategy);
       // Only the boolean is surfaced in the popup; the reveal timings stay at
@@ -202,17 +286,9 @@
       });
     }
 
-    $('profile').addEventListener('change', function () {
-      settings.profileName = $('profile').value;
-      saveSettings({ profileName: settings.profileName });
-    });
     $('mode').addEventListener('change', function () {
       settings.mode = $('mode').value;
       saveSettings({ mode: settings.mode });
-    });
-    $('concurrency').addEventListener('change', function () {
-      settings.maxConcurrent = clampConcurrent($('concurrency').value);
-      saveSettings({ maxConcurrent: settings.maxConcurrent });
     });
 
     // Packing settings are read by the content script when a run starts, so a
