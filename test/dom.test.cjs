@@ -10,8 +10,9 @@
 //
 // What these tests guard:
 //   * a text node is collected once, never once per ancestor element;
-//   * scripts / code / form controls / aria-hidden / translate="no" subtrees
-//     are never collected;
+//   * scripts / code / form controls / translate="no" subtrees are never
+//     collected, but visible aria-hidden text IS (aria-hidden hides from screen
+//     readers, not from eyes — real article paragraphs carry it);
 //   * writing a translation changes ONLY Text.nodeValue: the element tree,
 //     every attribute and every untouched text node stay byte-identical;
 //   * leading/trailing whitespace survives, so inline siblings do not glue;
@@ -186,7 +187,7 @@ const page = E('div', { id: 'site', class: 'wrap' },
     E('select', {}, E('option', {}, 'First choice')),
     E('script', {}, 'var tracker = function () { return "Script text here"; };'),
     E('style', {}, '.nav { color: red; }'),
-    E('div', { 'aria-hidden': 'true' }, 'Decorative glyph'),
+    E('p', { 'aria-hidden': 'true', class: 'kiosq-b' }, 'A body paragraph the CMS marked aria-hidden.'),
     E('div', { translate: 'no' }, 'Legal Code'),
     E('div', { class: 'notranslate' }, 'Do Not Translate'),
     E('div', { style: 'display:none' }, 'Hidden text body'),
@@ -303,7 +304,8 @@ ok('<textarea> left alone', !isCollected(findNode('Type your message')));
 ok('<option> left alone', !isCollected(findNode('First choice')));
 ok('<script> left alone', !isCollected(findNode('var tracker = function () { return "Script text here"; };')));
 ok('<style> left alone', !isCollected(findNode('.nav { color: red; }')));
-ok('aria-hidden subtree left alone', !isCollected(findNode('Decorative glyph')));
+ok('visible aria-hidden text is collected (it hides from screen readers, not eyes)',
+  isCollected(findNode('A body paragraph the CMS marked aria-hidden.')));
 ok('translate="no" left alone', !isCollected(findNode('Legal Code')));
 ok('.notranslate left alone', !isCollected(findNode('Do Not Translate')));
 const hiddenBodyNode = findNode('Hidden text body');
@@ -397,7 +399,9 @@ ok('nothing lost or duplicated by the packer', packs.reduce((n, bt) => n + bt.se
 ok('this small page fits in one request', packs.length === 1, packs.map((bt) => bt.segments.length));
 ok('the fragments around a link are not split', inSameBatch(beforeLink, linkSeg) && inSameBatch(linkSeg, afterLink));
 ok('list items travel together', inSameBatch(itemSegs[0], itemSegs[1]));
-const tightPacker = ns.createBatcher({ maxSegmentsPerBatch: 3, maxEstimatedTokensPerBatch: 100000, firstBatchMaxSegments: 3 });
+// This packer exists to squeeze the caps, so it asks for one slot per segment
+// (maxShortSegmentsPerBatch == maxSegmentsPerBatch turns the discount off).
+const tightPacker = ns.createBatcher({ maxSegmentsPerBatch: 3, maxEstimatedTokensPerBatch: 100000, firstBatchMaxSegments: 3, maxShortSegmentsPerBatch: 3 });
 const tightPacks = tightPacker.batchUnits(segmenter.sortSegmentsByViewport(segs));
 ok('a block bigger than the cap stays whole instead of being cut',
   tightPacks.some((bt) => linkTrio.every((s) => bt.segments.indexOf(s) !== -1)), tightPacks.map((bt) => bt.segments.length));
@@ -486,9 +490,12 @@ ok('every target node now holds Japanese', segs.every((s) => jp(s.source.node.no
 ok('the number of text nodes never changed while writing', textNodesOf(documentMock).length === textCountBefore);
 ok('untouched text nodes keep their exact value',
   !!findNode('const a = 1;\nconst b = 2;') && !!findNode('Type your message') && !!findNode('First choice') &&
-  !!findNode('var tracker = function () { return "Script text here"; };') && !!findNode('Decorative glyph') &&
+  !!findNode('var tracker = function () { return "Script text here"; };') &&
   !!findNode('Legal Code') && !!findNode('Do Not Translate') && !!findNode('Hidden text body') &&
   !!findNode('Editable area text') && !!findNode('SVG label') && !!findNode('これは日本語です。'));
+const ariaSeg = segs.filter((s) => /aria-hidden/.test(s.source.original))[0];
+ok('the visible aria-hidden paragraph was translated like any other body text',
+  !!ariaSeg && jp(ariaSeg.source.node.nodeValue));
 const wsNode = findNode('  Whitespace matters  ') || segs.filter((s) => s.text === 'Whitespace matters')
   .map((s) => s.source.node)[0];
 ok('surrounding whitespace restored around the translation', wsNode && /^\s+\S+\s+$/.test(wsNode.nodeValue) && jp(wsNode.nodeValue),

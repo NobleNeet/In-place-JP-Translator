@@ -102,7 +102,14 @@
   function shouldIgnore(el) {
     if (!el || el.nodeType !== 1) return false;
     if (SKIP_TAGS.has(tagNameOf(el))) return true;
-    if (getAttr(el, 'aria-hidden') === 'true') return true;
+    // NOTE: aria-hidden is deliberately NOT checked here. Per the ARIA spec it
+    // takes the element out of the *accessibility tree*, not off the screen, and
+    // plenty of publishing platforms put aria-hidden="true" on ordinary visible
+    // body paragraphs (the kiosq markup `p.kiosq-b[aria-hidden]` on a real
+    // article page did exactly that), so rejecting those subtrees threw away
+    // article text the reader was looking at. Text nobody can actually see is
+    // split out by content/priority.js, which asks the CSS instead of trusting
+    // an ARIA hint (see the visibility note below).
     if (getAttr(el, 'data-plamo-skip') != null) return true;
     var translate = getAttr(el, 'translate');
     if (translate && String(translate).toLowerCase() === 'no') return true;

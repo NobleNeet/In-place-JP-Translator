@@ -228,8 +228,10 @@ node test/dom.test.cjs     # extractor + segmenter + renderer + packer on a smal
 
 `test/dom.test.cjs` builds a page containing the structures that used to break
 (nested containers, text around inline links, `<pre>`/`<code>`, form controls,
-`script`/`style`, `aria-hidden`, `translate="no"`, `.notranslate`, hidden
-subtrees, `contenteditable`, SVG) and then checks that translating it
+`script`/`style`, `translate="no"`, `.notranslate`, hidden subtrees,
+`contenteditable`, SVG — and a visible `aria-hidden` paragraph, which **is**
+translated because aria-hidden hides text from screen readers, not from eyes)
+and then checks that translating it
 
 * produces exactly one segment per eligible text node, in document order;
 * leaves every skipped subtree untouched;
