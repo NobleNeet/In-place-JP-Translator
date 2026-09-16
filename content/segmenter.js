@@ -9,8 +9,9 @@
 // the whole page in hand:
 //   * ORDER. Segments come out in the order they should be sent: article body
 //     first, then headings, then page chrome, then anything that could not be
-//     placed, and inside each class whatever is on screen first (see
-//     content/priority.js for the classes).
+//     placed; inside each class whatever is on screen first, and inside that
+//     band the text nearest the top of the page first (see content/priority.js
+//     for the classes and the position keys).
 //   * DEFERRAL. When the extractor hands over its split result, the text nodes
 //     the user cannot see are left out of the list entirely — they cost no
 //     request until they are displayed. The caller keeps them for its own
@@ -77,13 +78,61 @@
     return out.join(' > ');
   }
 
-  function viewportPriority(el) {
-    if (!el.getBoundingClientRect) return 3;
-    var r = el.getBoundingClientRect();
-    if (r.top < window.innerHeight && r.bottom > 0) return 1;
-    var d = Math.min(Math.abs(r.top - window.innerHeight), Math.abs(r.bottom));
-    if (d < 400) return 2;
-    return 3;
+  function firstNumber() {
+    for (var i = 0; i < arguments.length; i++) {
+      var v = arguments[i];
+      if (typeof v === 'number' && isFinite(v)) return v;
+    }
+    return 0;
+  }
+
+  // Where the viewport sits inside the document, read ONCE per scan rather than
+  // once per text node: the page cannot scroll under a synchronous walk, and
+  // thousands of property lookups for nothing is what a 5000-node page would pay.
+  // `scrollY`/`scrollX` are the modern names, `pageYOffset`/`pageXOffset` their
+  // universal aliases, and the <html>/<body> scroll properties the quirks-mode
+  // document scrolls instead of the window.
+  var runScroll = { y: 0, x: 0 };
+  function readScroll() {
+    var win = (typeof window !== 'undefined' && window) ? window : null;
+    var doc = (typeof document !== 'undefined') ? document : null;
+    var html = doc ? doc.documentElement : null;
+    var body = doc ? doc.body : null;
+    runScroll.y = firstNumber(win && win.scrollY, win && win.pageYOffset,
+      html && html.scrollTop, body && body.scrollTop);
+    runScroll.x = firstNumber(win && win.scrollX, win && win.pageXOffset,
+      html && html.scrollLeft, body && body.scrollLeft);
+    return runScroll;
+  }
+
+  // One layout read answers both ordering questions about an element, because a
+  // second getBoundingClientRect() is another forced reflow on a page that may
+  // have thousands of them:
+  //   * the viewport band — 1 on screen, 2 within 400px of it, 3 elsewhere;
+  //   * where it sits in the DOCUMENT (`y`, and `x` for a tie on one line),
+  //     which is what orders text inside one band. The scroll offset is added so
+  //     the key survives a scroll between two scans of the same page.
+  // No rectangle at all (a node out of the layout, a DOM without one) leaves the
+  // position keys off, and the ordering falls back to the order the tree was
+  // walked. See content/priority.js.
+  function measure(el) {
+    var out = { viewport: 3 };
+    if (!el.getBoundingClientRect) return out;
+    var r = null;
+    try { r = el.getBoundingClientRect(); } catch (e) { r = null; }
+    if (!r) return out;
+    if (typeof r.top === 'number' && typeof r.left === 'number') {
+      out.y = Math.round(r.top + runScroll.y);
+      out.x = Math.round(r.left + runScroll.x);
+    }
+    var win = (typeof window !== 'undefined' && window) ? window : null;
+    var vh = (win && typeof win.innerHeight === 'number') ? win.innerHeight : 0;
+    if (r.top < vh && r.bottom > 0) out.viewport = 1;
+    else {
+      var d = Math.min(Math.abs(r.top - vh), Math.abs(r.bottom));
+      out.viewport = (d < 400) ? 2 : 3;
+    }
+    return out;
   }
 
   // --- structural grouping ----------------------------------------------------
@@ -159,6 +208,7 @@
         '(they replace whole subtrees and break the layout); collecting text nodes instead');
     }
     elementIds.clear();
+    readScroll();
     var collected = collectNodes(root, opts);
     var deferHidden = (opts.deferHidden != null) ? !!opts.deferHidden : deferHiddenByDefault();
     var nodes = collected.visible.slice();
@@ -188,11 +238,16 @@
       // to be second-guessed; `text` only feeds the "a long run of words is body
       // text" fallback for pages built out of anonymous <div>s.
       var cls = ctx ? prio.classify(ctx, parent, text) : null;
+      var where = measure(parent);
       segments.push({
         id: 'seg-' + (id++),
         text: text,
         estimatedTokens: estimateTokens(text),
-        viewport: viewportPriority(parent),
+        viewport: where.viewport,
+        // Document position (px, rounded): what orders text inside one viewport
+        // band. Absent when the element had no rectangle to measure.
+        y: where.y,
+        x: where.x,
         role: cls ? cls.role : '',
         priority: cls ? cls.priority : NO_PRIORITY,
         hidden: hiddenSet.has(node),
@@ -247,14 +302,17 @@
 
   // The order a run sends segments in: article body, then headings, then page
   // chrome, then whatever could not be placed — and inside each of those,
-  // whatever is on screen first (see content/priority.js). Text the user could
-  // not see goes last, which in practice means it is not in this list at all.
-  // Without content/priority.js there are no regions to order by, so the old
-  // viewport-only ordering is used and the page gets one warning about it.
+  // whatever is on screen first, then the text nearest the top of the page (see
+  // content/priority.js). Text the user could not see goes last, which in
+  // practice means it is not in this list at all. `opts.topDown: false` keeps the
+  // position keys out of the comparison. Without content/priority.js there are no
+  // regions to order by, so the old viewport-only ordering is used and the page
+  // gets one warning about it.
   var noPriorityWarned = false;
-  function sortSegments(segments) {
+  function sortSegments(segments, opts) {
     var list = (segments || []).slice();
     var prio = ns.priority;
+    if (prio && prio.createCompare) return list.sort(prio.createCompare(opts || {}));
     if (prio && prio.compare) return list.sort(prio.compare);
     if (!noPriorityWarned) {
       noPriorityWarned = true;

@@ -447,6 +447,63 @@ const keptDocOrder = (() => {
   return true;
 })();
 ok('document order kept inside one class and band', keptDocOrder);
+console.log('== priority: the page is filled in from the top down ==');
+// The tree walk hands the segmenter text in MARKUP order, and markup order is not
+// always display order: a flex list with `column-reverse`, a card the CSS floats
+// above its siblings, a sidebar the source lists before the article. Here three
+// article paragraphs sit in the document bottom-first, so only the measured
+// position can put the reading order back (all three are on screen, so the
+// viewport band cannot tell them apart either).
+const cardTop = E('p', {}, 'Card top text');
+const cardMiddle = E('p', {}, 'Card middle text');
+const cardBottom = E('p', {}, 'Card bottom text');
+cardTop._rect = { top: 200, bottom: 260, left: 0, right: 600 };
+cardMiddle._rect = { top: 380, bottom: 440, left: 0, right: 600 };
+cardBottom._rect = { top: 560, bottom: 620, left: 0, right: 600 };
+const cards = E('main', {}, cardBottom, cardMiddle, cardTop);
+const cardSegs = segmenter.buildSegments(cards);
+ok('the segmenter records where in the document a text node is',
+  cardSegs.length === 3 && cardSegs.every((s, i) => s.role === 'content' && s.viewport === 1),
+  cardSegs.map((s) => [s.role, s.viewport, s.y]));
+const downOrder = segmenter.sortSegments(cardSegs).map((s) => s.text).join(',');
+ok('inside one region and band, the text nearest the top of the page goes first',
+  downOrder === 'Card top text,Card middle text,Card bottom text', downOrder);
+const markupOrder = segmenter.sortSegments(cardSegs, { topDown: false }).map((s) => s.text).join(',');
+ok('markup order is one switch away (settings.priority.topDown = false)',
+  markupOrder === 'Card bottom text,Card middle text,Card top text', markupOrder);
+// A scroll between two scans must not reorder anything: the key is the position in
+// the DOCUMENT, not on the screen.
+windowMock.pageYOffset = 1200;
+const scrolledSegs = segmenter.buildSegments(cards);
+ok('the position is measured in the document, so a scroll does not move the queue',
+  segmenter.sortSegments(scrolledSegs).map((s) => s.text).join(',') === downOrder &&
+  scrolledSegs.every((s) => s.y > 1000),
+  scrolledSegs.map((s) => s.y));
+delete windowMock.pageYOffset;
+// Two fragments on one line (an inline link in the middle of a sentence) share a
+// `y`, so left-to-right decides and the sentence keeps its reading order.
+const lineEnd = E('span', {}, 'right hand fragment');
+const lineStart = E('span', {}, 'left hand fragment');
+lineStart._rect = { top: 40, bottom: 70, left: 20, right: 200 };
+lineEnd._rect = { top: 40, bottom: 70, left: 260, right: 480 };
+const line = E('p', {}, lineEnd, lineStart);
+ok('on one line, text to the left goes out first',
+  segmenter.sortSegments(segmenter.buildSegments(line)).map((s) => s.text).join(',') ===
+  'left hand fragment,right hand fragment');
+// No rectangle at all (a node the layout never measured) sorts after the measured
+// text of its band instead of jumping to the top of the page. Both of these are
+// far below the fold, so they are in one band and only the position can decide.
+const farBelow = E('p', {}, 'Far below the fold text');
+farBelow._rect = { top: 5000, bottom: 5060, left: 0, right: 600 };
+const noRect = E('p', {}, 'Unmeasured text');
+noRect.getBoundingClientRect = null;
+const mixedSegs = segmenter.buildSegments(E('main', {}, noRect, farBelow));
+const mixed = segmenter.sortSegments(mixedSegs);
+ok('both are one band below the fold, so only the position tells them apart',
+  mixedSegs.every((s) => s.viewport === 3), mixedSegs.map((s) => [s.text, s.y]));
+ok('text with no measured position goes last in its band, never first',
+  mixed.map((s) => s.text).join(',') === 'Far below the fold text,Unmeasured text',
+  mixed.map((s) => s.text));
 console.log('== priority: what region a text node sits in, and what waits ==');
 const roleOfText = (text) => (segs2.filter((s) => s.text === text)[0] || {}).role;
 ok('running-on text inside <main> is the article', roleOfText('Welcome to the product.') === 'content', roleOfText('Welcome to the product.'));

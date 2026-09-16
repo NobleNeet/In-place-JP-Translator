@@ -760,6 +760,20 @@ async function main() {
   ]).map((s) => s.id).join(',');
   ok('a run sends body text by position, then a heading, then chrome, hidden text last',
     pordered === 'more,body,title,chrome,later', pordered);
+  // Inside one region and one viewport band, the position down the page decides
+  // (content/segmenter.js measures it, content/priority.js compares it). Segments
+  // built by hand with no position at all keep the order they were handed over in.
+  const pxy = (id, y, x) => ({ id, text: id + ' sample text', role: 'content',
+    priority: prio.priorityOf('content'), viewport: 1, y: y, x: x });
+  const pxyList = [pxy('lower', 900, 0), pxy('higher', 40, 0), pxy('middle', 300, 0), pxy('unmeasured', null, null)];
+  ok('the text nearest the top of the page goes first, and unmeasured text last',
+    prio.sortSegments(pxyList).map((s) => s.id).join(',') === 'higher,middle,lower,unmeasured',
+    prio.sortSegments(pxyList).map((s) => s.id));
+  ok('one switch turns the position off and goes back to the order the tree was walked',
+    prio.sortSegments(pxyList, { topDown: false }).map((s) => s.id).join(',') ===
+    'lower,higher,middle,unmeasured', prio.sortSegments(pxyList, { topDown: false }).map((s) => s.id));
+  ok('on one line, text to the left goes out before text to the right',
+    prio.sortSegments([pxy('right', 300, 480), pxy('left', 300, 20)]).map((s) => s.id).join(',') === 'left,right');
   ok('the histogram a run logs counts every region it sent',
     (() => { const h = prio.histogram([pseg('a', 'content'), pseg('b', 'navigation'), pseg('c', 'other', true)]);
       return h.content === 1 && h.navigation === 1 && h.other === 1 && h.hidden === 1; })(),
@@ -768,6 +782,7 @@ async function main() {
   ok('the deferral is on by default and its timers are real numbers',
     prioDefaults.deferHidden === true && prioDefaults.revealDebounceMs > 0 &&
     prioDefaults.revealIntervalMs > 0 && prioDefaults.maxHiddenChecks > 0, prioDefaults);
+  ok('a region is read top-down by default', prioDefaults.topDown === true, prioDefaults);
   ok('a timer that is not a number keeps its default, and an absurd one is clamped',
     ns.settings.clampMs('fast', 250, 50, 60000) === 250 &&
     ns.settings.clampMs(1, 250, 50, 60000) === 50 &&
@@ -787,6 +802,14 @@ async function main() {
   ok('saving the hidden-text switch keeps the other priority settings',
     patched.priority.deferHidden === true && patched.priority.revealIntervalMs === 4000 &&
     patched.priority.maxHiddenChecks === 100000, patched.priority);
+  // The popup's "Order down the page" select saves the same object.
+  const topDownOff = await ns.settings.saveSettings({
+    priority: Object.assign({}, (await ns.settings.loadSettings()).priority, { topDown: false })
+  });
+  ok('the top-down switch survives a save and a reload',
+    topDownOff.priority.topDown === false &&
+    (await ns.settings.loadSettings()).priority.topDown === false &&
+    topDownOff.priority.deferHidden === true, topDownOff.priority);
   const afterPopup = await ns.settings.loadSettings();
   ok('and the next run reads that switch back, with the other settings intact',
     afterPopup.priority.deferHidden === true && afterPopup.priority.revealIntervalMs === 4000 &&

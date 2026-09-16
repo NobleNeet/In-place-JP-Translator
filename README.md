@@ -11,8 +11,9 @@ translation**, not translation quality per se.
   packed into batches and sent to the API **in parallel**. By default one batch
   is **one API request** carrying many text nodes, one node per line, so a page
   costs a handful of requests instead of hundreds.
-- Currently visible content is translated first (viewport priority), and
-  completed batches are applied to the DOM as they finish.
+- Currently visible content is translated first (viewport priority), inside one
+  region from the top of the page down, and completed batches are applied to the
+  DOM as they finish.
 - All network access is centralized in the background service worker; content
   scripts never call the API directly.
 
@@ -29,7 +30,7 @@ plamo-page-translator/
 │   ├── content.js           # orchestrator: extract -> segment -> batch -> apply
 │   ├── extractor.js         # collects translatable *text nodes* (never elements)
 │   ├── segmenter.js         # one segment per text node, language heuristic, block keys, tokens, priority
-│   ├── priority.js          # which region a text node sits in, and whether the user can see it
+│   ├── priority.js          # which region a text node sits in, where on the page it is, and whether the user can see it
 │   ├── renderer.js          # writes nodeValue only, registry for restore
 │   └── ui.js                # the corner button: 和訳 → 翻訳中… → 原文に戻す
 ├── api/
@@ -374,7 +375,7 @@ assumed all the time.
 Every text node also gets a **region**, and the region is what decides the order
 the rest of the page is sent in: hidden first out of the way, then the class
 (`content`, then `heading`, then `navigation`, then whatever is left), then the
-viewport band inside a class, then the order the tree was walked. The markers are
+viewport band inside a class, then **where on the page it sits**. The markers are
 `MAIN`/`ARTICLE`, `role=main|article|feed` and class words like `article`/`post`/
 `content` for the body; `H1`–`H6` for headings; `NAV`/`HEADER`/`FOOTER`/`ASIDE`/
 `MENU`, `role=navigation|menu|menubar|tablist|toolbar|search|banner|contentinfo|
@@ -384,6 +385,24 @@ you are. A run of 120+ characters with no marker at all counts as body text
 instead of being made to wait behind the menu. `__plamo.getState().roles` and the
 `roles={...}` in the run log show what a page is made of, which is how "it
 translated the menu before the article" gets answered with numbers.
+
+Inside one region and one viewport band the **position on the page** decides, so
+a page fills in the way it is read: the first answer lands at the top of the
+article and the rest of it appears downward, instead of the bottom of the article
+being translated before its first paragraph. The position is *measured*, not
+assumed from the markup, because the two disagree more often than they used to:
+flex `order`, a `column-reverse` card list, a sidebar the source lists before the
+article — on a modern page, markup order is rarely reading order. Measuring it
+costs nothing: the segmenter already asked `getBoundingClientRect()`
+once per element to place it in a viewport band, and the same rectangle gives the
+key (`y` down the page, then `x` on one line, in *document* coordinates so a
+scroll between two scans of one page does not reshuffle the queue). A segment
+with no rectangle to measure is not lost — it goes last inside its band, where
+the old ordering would have had it wherever the markup happened to list it. Turn
+it off with *Order down the page → markup (source) order* in the popup
+(`priority.topDown` in storage, `PRIORITY_SETTINGS.topDown` in
+`shared/constants.js`), and `__plamo.getPending().sample[].y` shows the exact key
+a run sorted on.
 
 Once a run holds text back, a **reveal watch** covers it: a `MutationObserver` on
 `style`, `class`, `hidden`, `aria-hidden`, `inert` and `open` (subtree) triggers a
@@ -402,8 +421,8 @@ waited for any more. `__plamo.getDeferred()` shows what is still waiting.
 To send hidden text with the rest of the page instead, choose *Hidden text →
 translate at once* in the popup (it applies to the next "Translate Page" press).
 The knobs live under `priority` in `chrome.storage.local` — `deferHidden`,
-`revealDebounceMs`, `revealIntervalMs`, `maxHiddenChecks` — with defaults in
-`PRIORITY_SETTINGS` in `shared/constants.js`.
+`topDown`, `revealDebounceMs`, `revealIntervalMs`, `maxHiddenChecks` — with
+defaults in `PRIORITY_SETTINGS` in `shared/constants.js`.
 
 ### The cache that outlives the page (`translation/persistent.js`)
 
@@ -477,9 +496,10 @@ segment at all. The three things that can leave text behind:
 - [x] Language heuristic (skips obvious non-English)
 - [x] Loose token estimation (separated function)
 - [x] Viewport priority (visible → near → rest)
-- [x] Region priority (article body → headings → page chrome) and hidden text
-      held back until it is displayed, with a reveal watch on `style`/`class`/
-      `hidden`/`aria-hidden`/`inert`/`open` (debounced re-check + fallback poll)
+- [x] Region priority (article body → headings → page chrome), the text nearest
+      the top of the page first inside a region, and hidden text held back until
+      it is displayed, with a reveal watch on `style`/`class`/`hidden`/
+      `aria-hidden`/`inert`/`open` (debounced re-check + fallback poll)
 - [x] Bounded batching (count + estimated tokens) with block-aware packing
 - [x] Multi-segment-per-request batching: one request carries a whole batch
       (one text node per line), mapped back by line count

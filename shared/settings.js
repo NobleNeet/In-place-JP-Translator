@@ -48,6 +48,7 @@
       // Which text a run sends first, and what it holds back (content/priority.js).
       priority: {
         deferHidden: C.PRIORITY_SETTINGS.deferHidden,
+        topDown: C.PRIORITY_SETTINGS.topDown,
         revealDebounceMs: C.PRIORITY_SETTINGS.revealDebounceMs,
         revealIntervalMs: C.PRIORITY_SETTINGS.revealIntervalMs,
         maxHiddenChecks: C.PRIORITY_SETTINGS.maxHiddenChecks
@@ -78,6 +79,7 @@
         // "did it appear yet?" watcher into a busy loop or switch it off with a
         // negative interval (see the reveal watch in content/content.js).
         deferHidden: booleanWith((patch.priority || {}).deferHidden, base.priority.deferHidden),
+        topDown: booleanWith((patch.priority || {}).topDown, base.priority.topDown),
         revealDebounceMs: clampMs((patch.priority || {}).revealDebounceMs, base.priority.revealDebounceMs, 50, 60000),
         revealIntervalMs: clampMs((patch.priority || {}).revealIntervalMs, base.priority.revealIntervalMs, 500, 600000),
         maxHiddenChecks: clampMs((patch.priority || {}).maxHiddenChecks, base.priority.maxHiddenChecks, 50, 100000)

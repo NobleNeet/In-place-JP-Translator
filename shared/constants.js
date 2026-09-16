@@ -112,6 +112,14 @@
     // orders *inside* a class, so the first answer lands on text on screen.
     PRIORITY_ROLES: ['content', 'heading', 'navigation', 'other'],
 
+    // Inside one region and one viewport band the position on the page decides:
+    // text nearer the TOP goes out first (left before right on one line). Reading
+    // order is top-down, but markup order often is not — flex `order`, a
+    // `column-reverse` card, a sidebar the source lists before the article — so
+    // the position is measured (one getBoundingClientRect() per element, the same
+    // read that decides the viewport band) rather than assumed from the tree
+    // walk. `topDown: false` ignores it and goes back to markup order.
+    //
     // Text the user cannot see — display:none, visibility:hidden, [hidden] — is
     // held back instead of being translated up front: the same words often exist
     // twice on a page (desktop menu + mobile menu + a closed modal), and the
@@ -119,6 +127,7 @@
     // is displayed, which is when it first becomes worth the model's time.
     PRIORITY_SETTINGS: {
       deferHidden: true,       // false = translate hidden text at once (old behaviour)
+      topDown: true,           // false = markup order instead of top-of-page-first
       revealDebounceMs: 250,   // how long a style/class change settles before a re-check
       revealIntervalMs: 4000,  // fallback re-check while hidden text is still pending
       maxHiddenChecks: 6000    // getComputedStyle() calls per scan, then assume visible

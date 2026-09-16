@@ -6,8 +6,9 @@
 // ns.ui.onRunEvent.
 //
 // Flow: collect TEXT NODES -> one segment per text node -> order by region
-// (article body, then headings, then page chrome) and inside a region by
-// viewport band -> pack the segments into batches, where one batch is ONE API
+// (article body, then headings, then page chrome), inside a region by viewport
+// band, and inside a band by how far down the page the text is -> pack the
+// segments into batches, where one batch is ONE API
 // request (paragraph fragments stay together, menu/list items are piled into
 // the same request) -> send each batch to the background (in parallel,
 // concurrency bound = requests in flight) -> write each finished translation
@@ -38,7 +39,8 @@
   // order) and answers two questions at once: the segments a run should send —
   // each holding its own Text node in segment.source.node — and the hidden text
   // nodes it held back instead of sending. sortSegments() is the send order:
-  // article body, then headings, then page chrome, viewport band inside each.
+  // article body, then headings, then page chrome, the viewport band inside
+  // each, and the position down the page inside that.
   var buildSegmentsResult = ns.segmenter.buildSegmentsResult;
   var sortSegments = ns.segmenter.sortSegments;
   // applySegment writes into a Text node (node.nodeValue only); the renderer
@@ -80,6 +82,9 @@
     var p = (settings && settings.priority) || {};
     return {
       deferHidden: p.deferHidden != null ? !!p.deferHidden : P.deferHidden !== false,
+      // Top-down inside a region and a viewport band, so the reader reaches the
+      // beginning of the text while its bottom is still being translated.
+      topDown: p.topDown != null ? !!p.topDown : P.topDown !== false,
       revealDebounceMs: Number(p.revealDebounceMs) || P.revealDebounceMs || 250,
       revealIntervalMs: Number(p.revealIntervalMs) || P.revealIntervalMs || 4000,
       maxHiddenChecks: Number(p.maxHiddenChecks) || P.maxHiddenChecks || 6000
@@ -94,6 +99,12 @@
     var o = prioritySettings();
     if (opts && opts.nodes) o.nodes = opts.nodes;
     return buildSegmentsResult(root, o);
+  }
+
+  // The sort half of the same knobs: the packer reads the list in this order, so
+  // it is the one place the top-down switch reaches a run.
+  function orderSettings() {
+    return { topDown: prioritySettings().topDown };
   }
   var cache = new SessionCache();
   var abortRequested = false;
@@ -627,7 +638,7 @@
       keepDeferred(built.deferred, sentNodes);
       log.info(tag + ' extracted segments=' + segments.length + ' viewport=' + JSON.stringify(countViewport(segments)) +
         ' roles=' + JSON.stringify(built.roles || {}) + ' deferred=' + built.stats.deferred +
-        ' deferHidden=' + built.stats.deferHidden +
+        ' deferHidden=' + built.stats.deferHidden + ' topDown=' + orderSettings().topDown +
         ' profile=' + settings.profileName + ' maxConcurrent=' + settings.maxConcurrent +
         ' apis=' + live.apis.map(function (a) { return a.name + '\u00d7' + a.concurrency; }).join('+') +
         ' cache=' + cache.map.size + ' cacheHits=' + cache.hits);
@@ -642,7 +653,7 @@
         return lastRun;
       }
 
-      segments = sortSegments(segments);
+      segments = sortSegments(segments, orderSettings());
       var segmentsById = {};
       segments.forEach(function (s) { segmentsById[s.id] = s; });
 
@@ -956,6 +967,9 @@
       roles: built.roles || null,
       deferredHidden: built.stats.deferred,
       deferHidden: built.stats.deferHidden,
+      // Whether the next run sorts by `y` inside a region and a viewport band
+      // (see __plamo.getBatchPlan() for the order that produces).
+      topDown: orderSettings().topDown,
       waitingForDisplay: deferredNodes.length,
       // Text nodes we have already rewritten (see __plamo.getApplied()).
       alreadyTranslated: renderer.appliedCount(),
@@ -966,6 +980,9 @@
       sample: segments.slice(0, 10).map(function (s) {
         return {
           id: s.id, viewport: s.viewport, role: s.role, priority: s.priority,
+          // Where in the document this sits (px): the tiebreak inside a region and
+          // a viewport band, and the way to read "it went top-down, right?".
+          y: (typeof s.y === 'number') ? s.y : null,
           hidden: s.hidden, chars: s.text.length,
           hasNode: !!(s.source && s.source.node), path: (s.source && s.source.path) || '',
           parentTag: (s.source && s.source.parentTag) || '',
@@ -984,7 +1001,7 @@
     var root = (opts && opts.root) || document;
     applyBatchSettings();
     var built = collectSegments(root, null);
-    var segments = sortSegments(built.segments);
+    var segments = sortSegments(built.segments, orderSettings());
     var unitList = batcher.units(segments);
     var batches = batcher.batchUnits(segments);
     return {
@@ -998,11 +1015,14 @@
       servers: activeApis(settings),
       viewport: countViewport(segments),
       // The order the packer sees: article body first, then headings, then page
-      // chrome. `deferredHidden` is text a run would not send at all, because
+      // chrome, and inside each of those the text nearest the top of the page.
+      // `topDown` says whether that last tiebreak is on. `deferredHidden` is text
+      // a run would not send at all, because
       // the user cannot see it (see __plamo.getDeferred()).
       roles: built.roles || null,
       deferredHidden: built.stats.deferred,
       deferHidden: built.stats.deferHidden,
+      topDown: orderSettings().topDown,
       batches: batches.slice(0, (opts && opts.limit) || 8).map(function (b, i) {
         return {
           index: i + 1, segments: b.segments.length, blocks: b.units,
@@ -1038,6 +1058,7 @@
       sample: missing.slice(0, (opts && opts.limit) || 15).map(function (s) {
         return {
           id: s.id, role: s.role, viewport: s.viewport, chars: s.text.length,
+          y: (typeof s.y === 'number') ? s.y : null,
           path: (s.source && s.source.path) || '',
           cached: cache.map.has(s.text),
           text: s.text.slice(0, 80)
@@ -1391,7 +1412,8 @@
   var prio0 = prioritySettings();
   log.info('content script ready v' + manifestVersion +
     ' (send order ' + ((C.PRIORITY_ROLES || []).join(' > ') || 'viewport only') +
-    ', deferHidden=' + prio0.deferHidden + ', re-check hidden text ' + prio0.revealDebounceMs +
+    ' then top-down=' + prio0.topDown + ', deferHidden=' + prio0.deferHidden +
+    ', re-check hidden text ' + prio0.revealDebounceMs +
     'ms after a style change and every ' + prio0.revealIntervalMs + 'ms)');
   log.info('diagnostics: __plamo.getState(), __plamo.getPending(), __plamo.getUntranslated(), ' +
     '__plamo.getDeferred(), __plamo.getBatchPlan(), __plamo.dumpLogs(), __plamo.pingBackground()');

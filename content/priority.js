@@ -8,7 +8,9 @@
 //      headers, footers and sidebars are page chrome and can wait; whatever
 //      could not be placed at all is last. Inside one class the viewport band
 //      (visible -> near -> rest) still decides, so the first answer always
-//      lands on text that is on screen.
+//      lands on text that is on screen — and inside one band the position on the
+//      page decides, so a page fills in from the top downwards and the reader
+//      can start reading while the bottom is still on its way.
 //
 //   2. IS it worth translating yet? Text the user cannot see (display:none,
 //      visibility:hidden, [hidden]) is held back: a closed dropdown, a modal and
@@ -201,22 +203,62 @@
   // --- ordering --------------------------------------------------------------
   // Text the user could not see at scan time goes last (and when it is being
   // held back for a later run, that is the only reason it is in the list at
-  // all); then the class, then the viewport band, then the order the extractor
-  // walked the tree (Array#sort is stable).
+  // all); then the class; then the viewport band; then where the text sits on
+  // the page: `y` ascending, so within one region of the page the reader meets
+  // the translations top-down instead of in whatever order the markup happens to
+  // list them (flex `order`, a `column-reverse` card, a sidebar that comes first
+  // in the source all make markup order and display order disagree), and `x`
+  // breaks a tie on one line, left to right. Only two segments that were never
+  // measured at all fall back to the order the extractor walked the tree
+  // (Array#sort is stable) — a segment with no position goes after the ones that
+  // have one, because nothing could tell where on the page it is.
+  //
+  // `topDown: false` ignores the position keys and stops at the viewport band:
+  // the ordering of builds that trusted markup order.
   function hiddenFlag(s) { return (s && (s.hidden || s.deferred)) ? 1 : 0; }
 
-  function compare(a, b) {
-    var ha = hiddenFlag(a);
-    var hb = hiddenFlag(b);
-    if (ha !== hb) return ha - hb;
-    var pa = (a && a.priority != null) ? a.priority : ROLES.length;
-    var pb = (b && b.priority != null) ? b.priority : ROLES.length;
-    if (pa !== pb) return pa - pb;
-    return ((a && a.viewport) || 0) - ((b && b.viewport) || 0);
+  // Measured position, or null when there is none (a node with no layout).
+  function coord(s, key) {
+    var v = s && s[key];
+    return (typeof v === 'number' && isFinite(v)) ? v : null;
   }
 
-  function sortSegments(segments) {
-    return (segments || []).slice().sort(compare);
+  // null sorts last, so an unmeasured segment never jumps ahead of measured text.
+  function compareCoords(a, b) {
+    if (a === b) return 0;
+    if (a === null) return 1;
+    if (b === null) return -1;
+    return a - b;
+  }
+
+  var TOP_DOWN = (PRIORITY.topDown == null) ? true : PRIORITY.topDown !== false;
+
+  // createCompare(opts) when a run has something to say about the order;
+  // `compare` is the default comparator, ready for Array#sort.
+  function createCompare(opts) {
+    var topDown = (opts && opts.topDown != null) ? !!opts.topDown : TOP_DOWN;
+    return function (a, b) {
+      var ha = hiddenFlag(a);
+      var hb = hiddenFlag(b);
+      if (ha !== hb) return ha - hb;
+      var pa = (a && a.priority != null) ? a.priority : ROLES.length;
+      var pb = (b && b.priority != null) ? b.priority : ROLES.length;
+      if (pa !== pb) return pa - pb;
+      var va = (a && a.viewport) || 0;
+      var vb = (b && b.viewport) || 0;
+      if (va !== vb) return va - vb;
+      if (!topDown) return 0;
+      var y = compareCoords(coord(a, 'y'), coord(b, 'y'));
+      if (y) return y;
+      return compareCoords(coord(a, 'x'), coord(b, 'x'));
+    };
+  }
+
+  var compare = createCompare();
+
+  function sortSegments(segments, opts) {
+    var cmp = (opts && opts.topDown != null) ? createCompare(opts) : compare;
+    return (segments || []).slice().sort(cmp);
   }
 
   // What a run would send per class — the numbers to read when the ordering
@@ -243,6 +285,7 @@
     createVisibility: createVisibility,
     hiddenByAttributes: hiddenByAttributes,
     compare: compare,
+    createCompare: createCompare,
     sortSegments: sortSegments,
     histogram: histogram,
     PROSE_MIN_CHARS: PROSE_MIN_CHARS

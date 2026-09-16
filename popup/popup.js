@@ -193,6 +193,10 @@
       if (hiddenSel) {
         hiddenSel.value = (settings.priority && settings.priority.deferHidden === false) ? 'now' : 'defer';
       }
+      var orderSel = $('order');
+      if (orderSel) {
+        orderSel.value = (settings.priority && settings.priority.topDown === false) ? 'markup' : 'topDown';
+      }
       var segSel = $('segments');
       if (segSel) {
         // A saved cap that is not one of the preset sizes (an older build, or a
@@ -317,6 +321,17 @@
       hiddenSel.addEventListener('change', function () {
         var defer = $('hidden').value !== 'now';
         settings.priority = Object.assign({}, settings.priority || {}, { deferHidden: defer });
+        saveSettings({ priority: settings.priority });
+      });
+    }
+    // Which order the next run sorts its segments in (content/priority.js): the
+    // region class always comes first, so this only decides the order *within*
+    // the article, within the headings, within the menu.
+    var orderSel = $('order');
+    if (orderSel) {
+      orderSel.addEventListener('change', function () {
+        var topDown = $('order').value !== 'markup';
+        settings.priority = Object.assign({}, settings.priority || {}, { topDown: topDown });
         saveSettings({ priority: settings.priority });
       });
     }
