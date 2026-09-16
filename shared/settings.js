@@ -33,6 +33,15 @@
         perSegmentFallback: C.REQUEST_SETTINGS.perSegmentFallback,
         batchSystemPrompt: C.REQUEST_SETTINGS.batchSystemPrompt
       },
+      // The exact-match translation cache that outlives the page
+      // (translation/persistent.js): caps of chrome.storage.local, oldest
+      // entries trimmed first. The session cache stays the hot layer in front.
+      cache: {
+        enabled: C.CACHE_SETTINGS.enabled,
+        maxEntries: C.CACHE_SETTINGS.maxEntries,
+        maxChars: C.CACHE_SETTINGS.maxChars,
+        maintainAfterChars: C.CACHE_SETTINGS.maintainAfterChars
+      },
       // Which text a run sends first, and what it holds back (content/priority.js).
       priority: {
         deferHidden: C.PRIORITY_SETTINGS.deferHidden,
@@ -52,6 +61,14 @@
       maxConcurrent: maxConcurrent,
       apis: normalizeApis(patch.apis),
       batch: Object.assign({}, base.batch, (patch.batch || {})),
+      cache: Object.assign({}, base.cache, (patch.cache || {}), {
+        // Clamped like every other stored number: a typo in maxEntries must not
+        // silently shrink the persistent cache to nothing (translation/persistent.js).
+        enabled: booleanWith((patch.cache || {}).enabled, base.cache.enabled),
+        maxEntries: clampMs((patch.cache || {}).maxEntries, base.cache.maxEntries, 1, 200000),
+        maxChars: clampMs((patch.cache || {}).maxChars, base.cache.maxChars, 1000, 100000000),
+        maintainAfterChars: clampMs((patch.cache || {}).maintainAfterChars, base.cache.maintainAfterChars, 1000, 100000000)
+      }),
       priority: Object.assign({}, base.priority, (patch.priority || {}), {
         // The numbers are clamped, not trusted: a stored typo must not turn the
         // "did it appear yet?" watcher into a busy loop or switch it off with a

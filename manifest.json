@@ -33,8 +33,10 @@
         "content/renderer.js",
         "translation/batcher.js",
         "translation/cache.js",
+        "translation/persistent.js",
         "translation/queue.js",
-        "content/content.js"
+        "content/content.js",
+        "content/ui.js"
       ]
     }
   ]

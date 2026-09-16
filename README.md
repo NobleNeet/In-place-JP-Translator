@@ -30,7 +30,8 @@ plamo-page-translator/
 │   ├── extractor.js         # collects translatable *text nodes* (never elements)
 │   ├── segmenter.js         # one segment per text node, language heuristic, block keys, tokens, priority
 │   ├── priority.js          # which region a text node sits in, and whether the user can see it
-│   └── renderer.js          # writes nodeValue only, registry for restore
+│   ├── renderer.js          # writes nodeValue only, registry for restore
+│   └── ui.js                # the corner button: 和訳 → 翻訳中… → 原文に戻す
 ├── api/
 │   ├── profiles.js          # API profiles (endpoints, model, apiKey)
 │   └── openai-client.js     # OpenAI-compatible client (swap-able later)
@@ -38,7 +39,8 @@ plamo-page-translator/
 │   ├── queue.js             # ordered queue
 │   ├── batcher.js           # packs DOM blocks into API requests (count/slot + token caps)
 │   ├── scheduler.js         # concurrency semaphore (one per API profile)
-│   └── cache.js             # session in-memory cache
+│   ├── cache.js             # session in-memory cache
+│   └── persistent.js        # exact-match cache in chrome.storage.local (survives the page)
 ├── shared/
 │   ├── logger.js            # toggleable console logging
 │   ├── constants.js         # message types + tunable defaults
@@ -159,14 +161,25 @@ segments per request, request packing) are persisted in `chrome.storage.local`.
 
 ## How to start a translation
 
-Phase 1 does **not** translate automatically. Start it manually:
+Phase 1 does **not** translate automatically. Start it manually, either from
+the popup or from the button the extension adds to every page:
 
 1. Open an English web page.
-2. Click the PLaMo 2 Translator icon.
-3. Click **Translate Page**.
-4. (Optionally tick the API servers to use — several at once are supported —
+2. Click the **和訳** button in the bottom-right corner (or the extension icon
+   and **Translate Page** in the popup).
+3. The button becomes **翻訳中… n/m** and keeps counting; while a run is in
+   flight clicking it means **stop** (in-flight batches still land, but no new
+   request — not even a reveal — goes out; same as **Stop Translation** in the
+   popup or `__plamo.stopTranslation()`).
+4. When the page is translated the button turns into **原文に戻す**, which puts
+   every text node back to its original (same as `__plamo.restoreAll()`).
+5. (Optionally tick the API servers to use — several at once are supported —
    and set each one's concurrency in the popup first.)
-5. To stop, click **Stop Translation**.
+
+The widget carries the `plamo-ui` class and `data-plamo-skip`, which the
+extractor skips, so it never translates its own button. Its styling is all
+inline because a page's Content-Security-Policy can refuse an extension the
+right to inject a `<style>` element.
 
 ---
 
@@ -191,8 +204,12 @@ Start / completion summary from the content script:
 
 ```
 [PLaMoTranslate] packing segments=412 blocks=268 requests=24 caps=24seg/900tok first=8 strategy=multi (segments/request=17.2)
-[PLaMoTranslate] done total=412 translated=410 applied=410 failed=2 skipped=0 cacheHits=3 requests=26 (24 request(s) for 412 segment(s)) in 9821ms firstTranslated=612ms cache=409
+[PLaMoTranslate] done total=412 translated=410 applied=410 failed=2 skipped=0 cacheHits=3 requests=26 (24 request(s) for 412 segment(s)) persisted=407 persistentHits=0 in 9821ms firstTranslated=612ms cache=409
 ```
+
+`persisted` is what the run stored in the cache that outlives the page, and
+`persistentHits` what that cache answered before the first request went out —
+on a page you have visited before, `requests` collapses towards 0.
 
 You can also inspect live state from the console:
 
@@ -204,6 +221,9 @@ window.__plamo.getApplied(20)  // one row per text node we rewrote: { path, befo
 window.__plamo.scanStats()     // elements walked, skipped subtrees, refused text nodes
 window.__plamo.restoreText(n)  // put one text node back (n from getApplied/getPending)
 window.__plamo.getCache()      // SessionCache { map, hits, misses }
+window.__plamo.getPersistentCache() // the store that survives the page: { enabled, pending, maxEntries, maxChars, ... }
+window.__plamo.clearPersistentCache() // remove every stored translation (Promise)
+window.__plamo.stopTranslation() // the Stop the widget's button offers mid-run
 window.__plamo.getSettings()   // current settings
 window.__plamo.getBatchPlan()  // how the next run would be packed: { segments, blocks, requests, segmentsPerRequest, caps, strategy, batches }
 window.__plamo.getBatcherCaps()// the caps the packer in use was built with (proves a saved setting landed)
@@ -222,8 +242,8 @@ window.__plamo.forgetDeferred()// drop the waiting list (a page that re-rendered
 No test framework and no dependencies; both suites run on plain Node:
 
 ```
-node test/logic.test.cjs   # queue, batcher/packer, scheduler, cache, batch request + line alignment, background, messaging
-node test/dom.test.cjs     # extractor + segmenter + renderer + packer on a small fake DOM
+node test/logic.test.cjs   # queue, batcher/packer, scheduler, caches, batch request + line alignment, background, messaging
+node test/dom.test.cjs     # extractor + segmenter + renderer + packer + reveal watch + echo retry + persistent cache on a small fake DOM
 ```
 
 `test/dom.test.cjs` builds a page containing the structures that used to break
@@ -385,6 +405,29 @@ The knobs live under `priority` in `chrome.storage.local` — `deferHidden`,
 `revealDebounceMs`, `revealIntervalMs`, `maxHiddenChecks` — with defaults in
 `PRIORITY_SETTINGS` in `shared/constants.js`.
 
+### The cache that outlives the page (`translation/persistent.js`)
+
+The session cache dies with the page, so every visit re-translated the same
+`About us` and the same article you read last week. `translation/persistent.js`
+keeps finished translations in `chrome.storage.local`: the back button, or a
+page opened in a second tab, then costs only the text nobody has ever translated.
+
+- **Exact match only.** Keys are built from a hash of the source text, but the
+  hash is just an index: every stored entry carries its source, and a lookup
+  hits only when it equals the asked text byte for byte. A hash collision
+  degrades to a cache miss, never to a mistranslation. One character different
+  is a miss.
+- **Only landed translations are stored.** An echo (the model copying the
+  English) or a write that was refused never enters the store — that is exactly
+  the bug class the session cache had, promoted to permanent storage.
+- **One read before the run, one write at its end.** A page's unique texts are
+  looked up in a single `storage.get` before the first request goes out, and
+  everything the run applied is written back in a single `storage.set`.
+- **Capped and trimmed** (`CACHE_SETTINGS` in `shared/constants.js`): past
+  `maxEntries`/`maxChars`, `maintain()` removes the oldest entries first. The
+  store lives under the `plamo-t-` key prefix; `__plamo.clearPersistentCache()`
+  empties it, and `settings.cache.enabled: false` turns the layer off.
+
 ### When a paragraph stays in English
 
 `__plamo.getUntranslated()` answers "why is this paragraph still English?" in
@@ -437,7 +480,11 @@ segment at all. The three things that can leave text behind:
 - [x] Transport-failure recovery: a batch whose request died is re-sent as
       several small requests instead of losing its segments
 - [x] Per-segment error isolation (one batch failing doesn't stop the rest)
-- [x] Session cache for duplicate text
+- [x] Session cache for duplicate text, plus an exact-match cache in
+      `chrome.storage.local` that survives the page (`translation/persistent.js`:
+      the back button and second tabs cost no requests)
+- [x] Corner widget: **和訳** → **翻訳中… n/m** (click = stop) → **原文に戻す**
+      (`content/ui.js`, run events from the orchestrator)
 - [x] Original text preserved in `data-*` attributes
 - [x] Metrics + per-batch console logging (toggleable)
 

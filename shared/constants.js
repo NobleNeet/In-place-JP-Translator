@@ -124,6 +124,23 @@
       maxHiddenChecks: 6000    // getComputedStyle() calls per scan, then assume visible
     },
 
+    // --- the exact-match cache that outlives the page -------------------------
+    // translation/persistent.js keeps finished translations in
+    // chrome.storage.local, keyed by a hash of the source text; every entry
+    // also stores its source, so a hit is a byte-for-byte identical text.
+    // This is what makes the back button, or a page opened in another tab
+    // before, cost only the text nobody has ever translated. The session
+    // cache (translation/cache.js) stays the hot layer in front of it.
+    CACHE_SETTINGS: {
+      enabled: true,
+      // chrome.storage.local holds 10 MB without the "unlimitedStorage"
+      // permission, so the store is trimmed to these caps (oldest entries
+      // first) once a run has stored `maintainAfterChars` of new text.
+      maxEntries: 40000,
+      maxChars: 3000000,      // counted over source + translation
+      maintainAfterChars: 200000
+    },
+
     // Extraction unit is a Text node (never an element): see content/extractor.js.
     // minTextLength drops "a", "»", "2" fragments the model would only mangle.
     // maxTextLength used to be 5000, which silently threw away long article

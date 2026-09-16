@@ -620,15 +620,28 @@ ok('a node the page threw away is not waited on for ever',
 console.log('== reveal watch: hidden text waits and is translated when displayed ==');
 
 const stored = {};
+// The sections below predate the persistent cache and count requests per run;
+// they keep the old session-cache-only behaviour. The persistent-cache section
+// at the end turns it on again through putSettings.
+stored.plamo = { cache: { enabled: false } };
 const bg = { requests: 0, sent: [] }; // the fake worker: what it was asked to translate
 function answerTranslate(msg, respond) {
   const wire = (msg && msg.batch && msg.batch.segments) || [];
+  // Like the real worker, a text the page already carries (msg.cache) is
+  // answered from that cache and costs no request.
+  const wireCache = (msg && msg.cache) || {};
   const results = {};
+  let cachedAnswers = 0;
   // An echo-retry request identifies itself by the explicit instruction the
   // page adds (content.js: ECHO_RETRY_PROMPT as request.batchSystemPrompt).
   const strict = !!(msg.request && msg.request.batchSystemPrompt);
   (bg.prompts = bg.prompts || []).push(strict ? 'strict' : 'plain');
   wire.forEach((s) => {
+    if (typeof wireCache[s.text] === 'string') {
+      cachedAnswers++;
+      results[s.id] = { text: s.text, translatedText: wireCache[s.text], cached: true };
+      return;
+    }
     bg.requests++;
     bg.sent.push(s.text);
     // bg.echo lists the texts this fake server answers with a copy of the
@@ -640,8 +653,8 @@ function answerTranslate(msg, respond) {
     results[s.id] = { text: s.text, translatedText: out };
   });
   setTimeout(() => respond({
-    requestId: msg.id, status: 'success', results, translated: wire.length, failed: 0,
-    cacheHits: 0, requests: 1, segments: wire.length, units: (msg.batch && msg.batch.units) || 1,
+    requestId: msg.id, status: 'success', results, translated: wire.length - cachedAnswers, failed: 0,
+    cacheHits: cachedAnswers, requests: 1, segments: wire.length, units: (msg.batch && msg.batch.units) || 1,
     elapsedMs: 1, profile: 'fake', endpoint: 'http://127.0.0.1:9/v1', strategy: 'multi'
   }), 0);
 }
@@ -657,7 +670,11 @@ sandbox.chrome = {
       if (typeof cb === 'function') setTimeout(() => cb({ ok: true }), 0); // status pings
     }
   },
-  storage: { local: { get: async () => Object.assign({}, stored), set: async (o) => Object.assign(stored, o) } }
+  storage: { local: {
+    get: async () => Object.assign({}, stored),
+    set: async (o) => Object.assign(stored, o),
+    remove: async (keys) => { (Array.isArray(keys) ? keys : [keys]).forEach((k) => { delete stored[k]; }); }
+  } }
 };
 sandbox.setInterval = setInterval; // the watcher's fallback poll (no MutationObserver here)
 // The orchestrator's own log lines, kept so a failing expectation below can be
@@ -675,7 +692,7 @@ sandbox.setTimeout = setTimeout;
 sandbox.clearTimeout = clearTimeout;
 sandbox.clearInterval = clearInterval;
 const contentOrder = ['shared/messaging.js', 'shared/settings.js', 'api/profiles.js',
-  'api/openai-client.js', 'translation/cache.js', 'content/content.js'];
+  'api/openai-client.js', 'translation/cache.js', 'translation/persistent.js', 'content/content.js'];
 for (const f of contentOrder) vm.runInContext(readFileSync(path.join(dir, f), 'utf8'), ctx, { filename: f });
 
 const api = sandbox.window.__plamo;
@@ -769,7 +786,7 @@ const putSettings = (patch) => sandbox.chrome.storage.local.set(patch);
     api.getState().waitingForDisplay === 0, api.getDeferred().sample.map((s) => s.text));
 
   // "Translate hidden text at once" has to mean exactly that.
-  await putSettings({ plamo: { priority: { deferHidden: false } } });
+  await putSettings({ plamo: { priority: { deferHidden: false }, cache: { enabled: false } } });
   const third = closedBox('c');
   await api.translatePage();
   await waitIdle();
@@ -778,7 +795,7 @@ const putSettings = (patch) => sandbox.chrome.storage.local.set(patch);
     [api.getState().deferred, third.texts.map((t) => t.nodeValue)]);
   ok('hidden text that run translated is not queued for a reveal',
     api.getState().waitingForDisplay === 0, api.getDeferred().sample.map((s) => s.text));
-  await putSettings({ plamo: { priority: { deferHidden: true } } });
+  await putSettings({ plamo: { priority: { deferHidden: true }, cache: { enabled: false } } });
 
   const fourth = closedBox('d');
   await api.translatePage();
@@ -843,6 +860,67 @@ const putSettings = (patch) => sandbox.chrome.storage.local.set(patch);
   ok('a copy does not count as translated', runB.translated === 0, runB.translated);
   bg.echo = null;
   bg.echoHard = false;
+
+  // --- the cache that outlives the page ---------------------------------------
+  // The session cache dies with the page; translation/persistent.js keeps the
+  // finished translations in storage and serves them again when the exact same
+  // text shows up - after restoreAll(), on the back button, in a tab that held
+  // this page before. A hit requires a byte-for-byte identical source.
+  console.log('== persistent cache: the second visit costs no requests ==');
+  await putSettings({ plamo: { priority: { deferHidden: true }, cache: { enabled: true } } });
+  const pcBox = E('div', { class: 'pc-zone' },
+    E('p', {}, 'Remembered across pages one'), E('p', {}, 'Remembered across pages two'));
+  mainEl.appendChild(pcBox);
+  const pcNodes = pcBox.querySelectorAll('p').map((p) => p.firstChild);
+  const reqBeforePC = bg.requests;
+  const runPC1 = await api.translatePage(pcBox);
+  ok('first visit sends the texts and stores what landed',
+    bg.requests === reqBeforePC + 2 && runPC1.applied === 2 && runPC1.persisted === 2,
+    [bg.requests - reqBeforePC, runPC1.applied, runPC1.persisted]);
+  const pcKeys = () => Object.keys(stored).filter((k) => k.indexOf('plamo-t-') === 0);
+  ok('the entries are in storage, and the queue is written out empty',
+    pcKeys().length === 2 && api.getPersistentCache().pending === 0,
+    [pcKeys().length, api.getPersistentCache()]);
+
+  // The page is put back to English and the SESSION cache is cleared, so from
+  // here only the persistent one can answer. This is the back-button shape.
+  const reqAfterPC1 = bg.requests;
+  api.restoreAll();
+  api.clearCache();
+  const runPC2 = await api.translatePage(pcBox);
+  ok('the second visit costs not one request', bg.requests === reqAfterPC1,
+    [bg.requests, reqAfterPC1]);
+  ok('the translations landed from storage anyway',
+    pcNodes.every((n) => jp(n.nodeValue)) && runPC2.applied === 2,
+    pcNodes.map((n) => n.nodeValue));
+  ok('both cache layers report the hits', runPC2.cacheHits >= 2 && runPC2.persistentHits >= 2,
+    [runPC2.cacheHits, runPC2.persistentHits]);
+
+  const pcNear = await ns.persistentCache.lookup(['Remembered across pages onx']);
+  ok('a one-character difference is not a match, not even from storage',
+    Object.keys(pcNear.hits).length === 0, pcNear);
+
+  // One more fresh text, then cap the store at two entries: maintain() trims
+  // oldest-first, so only the newest translation is left standing.
+  const pcLateBox = E('div', {}, E('p', {}, 'Trimmed old text three'));
+  mainEl.appendChild(pcLateBox);
+  await sleep(10); // a distinct `at`, so the trim below has an unambiguous order
+  await api.translatePage(pcLateBox);
+  ns.persistentCache.configure({ maxEntries: 2 });
+  const pcTrimmed = await ns.persistentCache.maintain();
+  ok('maintain() trims the store to its cap, oldest first', pcTrimmed === 2, pcTrimmed);
+  const pcGone = await ns.persistentCache.lookup(['Remembered across pages one', 'Remembered across pages two']);
+  const pcKept = await ns.persistentCache.lookup(['Trimmed old text three']);
+  ok('the trimmed entries answer as misses, the newest still answers',
+    Object.keys(pcGone.hits).length === 0 && Object.keys(pcKept.hits).length === 1,
+    [pcGone.hits, pcKept.hits]);
+  const stubbornKeys = pcKeys().filter((k) => stored[k].s === 'Stubborn wording here');
+  ok('a copied answer never enters the cache that outlives the page',
+    stubbornKeys.length === 0, stubbornKeys);
+  ns.persistentCache.configure({});
+  const pcCleared = await api.clearPersistentCache();
+  ok('__plamo.clearPersistentCache() empties the store',
+    pcCleared.removed === 1 && pcKeys().length === 0, pcCleared);
 
 })().then(finish, function (err) {
   fail++;

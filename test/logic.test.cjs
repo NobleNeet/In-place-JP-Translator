@@ -17,6 +17,7 @@ const dir = '/mnt/240GB01/chrome_addon/In-place-JP-Translator';
 const order = [
   'shared/logger.js','shared/constants.js','shared/messaging.js','shared/settings.js',
   'api/profiles.js','api/openai-client.js','translation/scheduler.js','translation/cache.js',
+  'translation/persistent.js',
   'translation/batcher.js','translation/queue.js','content/extractor.js','content/priority.js',
   'content/segmenter.js','content/renderer.js','background/background.js',
   'content/content.js','popup/popup.js'
@@ -69,7 +70,11 @@ function makePortPair(name) {
 }
 
 const chromeFake = {
-  storage: { local: { get: async () => Object.assign({}, _d), set: async (o) => { Object.assign(_d, o); } } },
+  storage: { local: {
+    get: async () => Object.assign({}, _d),
+    set: async (o) => { Object.assign(_d, o); },
+    remove: async (keys) => { (Array.isArray(keys) ? keys : [keys]).forEach((k) => { delete _d[k]; }); }
+  } },
   runtime: {
     id: 'test-extension',
     lastError: null,
@@ -152,7 +157,7 @@ const ok = (name, cond) => { if (cond) { pass++; console.log('  ok  ' + name); }
 
 async function main() {
   console.log('== modules loaded ==');
-  ['logger','constants','messaging','settings','profiles','openaiClient','Semaphore','SessionCache','createBatcher','Queue','extractor','segmenter','renderer','background'].forEach(k => ok('ns.' + k, typeof ns[k] !== 'undefined'));
+  ['logger','constants','messaging','settings','profiles','openaiClient','Semaphore','SessionCache','persistentCache','createBatcher','Queue','extractor','segmenter','renderer','background'].forEach(k => ok('ns.' + k, typeof ns[k] !== 'undefined'));
 
   console.log('== estimateTokens ==');
   const est = ns.segmenter.estimateTokens;
@@ -784,6 +789,62 @@ async function main() {
     afterPopup.priority.deferHidden === true && afterPopup.priority.revealIntervalMs === 4000 &&
     afterPopup.profileName === 'local-plamo2' && afterPopup.batch.maxSegmentsPerBatch > 0,
     [afterPopup.priority, afterPopup.profileName, afterPopup.batch]);
+  const cacheDefaults = ns.settings.defaultSettings().cache;
+  ok('the cache that outlives the page is on by default, with real caps',
+    cacheDefaults.enabled === true && cacheDefaults.maxEntries > 0 &&
+    cacheDefaults.maxChars > 0 && cacheDefaults.maintainAfterChars > 0, cacheDefaults);
+
+  console.log('\n== the cache that outlives the page (translation/persistent.js) ==');
+  // Finished translations live in storage keyed by a hash of the source text,
+  // but a hit requires the stored SOURCE to equal the asked text byte for byte:
+  // the back button then costs nothing, and a hash collision cannot mistranslate.
+  const pc = ns.persistentCache;
+  pc.configure({});
+  const pcText1 = 'The factory ruins were converted into a quiet library.';
+  const pcText2 = 'Rain slid off the roof in long silver threads.';
+  const pcT1 = '工場跡地は静かな図書館に転用された。';
+  const pcT2 = '雨は屋根から銀の長い筋を滑り落とした。';
+  ok('remember() queues, and the same pair twice queues once',
+    pc.remember(pcText1, pcT1) === true && pc.remember(pcText1, pcT1) === false &&
+    pc.snapshot().pending === 1, pc.snapshot());
+  const pcBefore = await pc.lookup([pcText1]);
+  ok('queued is not stored yet: a flush-less lookup cannot hit',
+    pcBefore.hits[pcText1] === undefined && pcBefore.queried === 1, pcBefore);
+  pc.remember(pcText2, pcT2);
+  await new Promise((r) => setTimeout(r, 5)); // a distinct `at`, so the trim below has an order
+  const flush1 = await pc.flush();
+  ok('flush() writes the whole queue', flush1.written === 2, flush1);
+  const pcHit = await pc.lookup([pcText1, 'a near miss of ' + pcText2]);
+  ok('stored text hits on an exact match', pcHit.hits[pcText1] === pcT1, pcHit);
+  ok('one edit away is not a match: the near miss stays a miss',
+    pcHit.hits['a near miss of ' + pcText2] === undefined && pcHit.queried === 2, pcHit);
+  // A fake collision: put a DIFFERENT text under the key this text hashes to.
+  // The hash may index, but only `s === text` may answer.
+  const collideKey = pc.entryKey(pcText1);
+  await chromeFake.storage.local.set({ [collideKey]: { s: 'some other sentence entirely', t: '別の文', at: Date.now() } });
+  const pcCollide = await pc.lookup([pcText1]);
+  ok('a colliding key never mistranslates: the stored source must equal the text',
+    pcCollide.hits[pcText1] === undefined, pcCollide);
+  // maintain() trims to 90% of the caps, oldest (`at`) first.
+  const trimOld = 'Oldest remembered wording kept for the trim test.';
+  const trimMid = 'Middle remembered wording kept for the trim test.';
+  const trimNew = 'Newest remembered wording kept for the trim test.';
+  pc.remember(trimOld, 'A');
+  await new Promise((r) => setTimeout(r, 5));
+  pc.remember(trimMid, 'B');
+  await new Promise((r) => setTimeout(r, 5));
+  pc.remember(trimNew, 'C');
+  await pc.flush();
+  pc.configure({ maxEntries: 2 });
+  const trimmed = await pc.maintain();
+  ok('maintain() trims oldest-first down to the cap', trimmed === 4, trimmed);
+  const afterTrim = await pc.lookup([trimOld, trimMid, trimNew]);
+  ok('only the newest entry survives the trim',
+    afterTrim.hits[trimNew] === 'C' && afterTrim.hits[trimOld] === undefined &&
+    afterTrim.hits[trimMid] === undefined, afterTrim);
+  pc.configure({});
+  const cleared = await pc.clear();
+  ok('clear() removes every stored entry and reports it', cleared.removed === 1, cleared);
 
   console.log('\nRESULT: ' + pass + ' passed, ' + fail + ' failed');
   process.exit(fail === 0 ? 0 : 1);

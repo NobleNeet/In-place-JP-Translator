@@ -1,7 +1,9 @@
 // content/content.js
 // Classic-script orchestrator. Runs in the page's content-script scope.
 // Loads in order: logger, constants, settings, profiles, openai-client,
-// priority, extractor, segmenter, renderer, batcher, cache, queue.
+// priority, extractor, segmenter, renderer, batcher, cache, persistent, queue;
+// content/ui.js (the corner button) loads after it and watches runs via
+// ns.ui.onRunEvent.
 //
 // Flow: collect TEXT NODES -> one segment per text node -> order by region
 // (article body, then headings, then page chrome) and inside a region by
@@ -104,6 +106,31 @@
 
   function lastErrorMessage(err) {
     return String((err && err.message) || err || '');
+  }
+
+  // The corner widget (content/ui.js) watches the run to draw its button. It is
+  // an optional module: a page keeps translating from the popup even if ui.js
+  // failed to load, so every report is wrapped and loud exactly once.
+  function uiEvent(kind) {
+    try {
+      if (ns.ui && ns.ui.onRunEvent) ns.ui.onRunEvent(kind);
+    } catch (e) {
+      log.trace('ui event "' + kind + '" failed: ' + lastErrorMessage(e));
+    }
+  }
+
+  // The cache that outlives the page (translation/persistent.js) is likewise
+  // optional in the load order, but losing it means every page view re-sends
+  // text translated days ago, so say it out loud once.
+  var persistentWarned = false;
+  function persistent() {
+    if (ns.persistentCache) return ns.persistentCache;
+    if (!persistentWarned) {
+      persistentWarned = true;
+      log.warn('translation/persistent.js is not loaded: every page view will re-translate text earlier visits already knew '
+        + '(check the content_scripts order in manifest.json)');
+    }
+    return null;
   }
 
   // sendMessage wrapper that logs the request/response pair with one id, so a
@@ -243,7 +270,7 @@
   function emptySummary() {
     return {
       total: 0, translated: 0, failed: 0, cacheHits: 0, applied: 0, skipped: 0,
-      requests: 0, batches: 0, units: 0,
+      requests: 0, batches: 0, units: 0, persisted: 0, persistentHits: 0,
       elapsedMs: 0, firstTranslatedLatencyMs: 0, firstViewportLatencyMs: 0,
       errorCounts: {}, skipCounts: {}, errors: []
     };
@@ -275,6 +302,7 @@
     live.skipped = stats.skipped;
     live.errorCounts = stats.errorCounts;
     live.skipCounts = stats.skipCounts;
+    uiEvent('progress'); // the widget reads getState() itself; this only says "look again"
   }
 
   function countError(stats, kind) {
@@ -332,7 +360,15 @@
       var out = applySegment(seg, r.translatedText);
       if (out.ok) {
         applied++;
-        if (typeof textKey === 'string' && typeof r.translatedText === 'string') cache.set(textKey, r.translatedText);
+        if (typeof textKey === 'string' && typeof r.translatedText === 'string') {
+          cache.set(textKey, r.translatedText);
+          // Landed translations only: an 'identical' or refused answer must
+          // never reach the cache that outlives the page, or the next visit
+          // would serve the copy without ever retrying (translation/persistent.js
+          // queues it here; the run's flush() writes once at the end).
+          var persist = persistent();
+          if (persist && persist.enabled()) persist.remember(textKey, r.translatedText);
+        }
       }
       else {
         stats.skipped++;
@@ -564,6 +600,7 @@
       skipCounts: {}, startedAt: Date.now()
     };
     log.info(tag + ' translatePage start (profile=' + (settings && settings.profileName) + ' cache=' + cache.map.size + ')');
+    uiEvent('run-start');
     return loadSettings().then(function (s) {
       settings = s; // apply popup changes immediately
       // The saved caps have to reach the packer, which was built before settings
@@ -601,131 +638,181 @@
         log.warn(tag + ' nothing to translate (0 segments' + (built.stats.deferred ?
           ', but ' + built.stats.deferred + ' hidden text node(s) are held back and will be translated when displayed' : '') +
           '). If this page is English and untouched, check __plamo.getPending().');
+        uiEvent('run-end');
         return lastRun;
       }
 
       segments = sortSegments(segments);
       var segmentsById = {};
       segments.forEach(function (s) { segmentsById[s.id] = s; });
-      // One batch = one API request: the units are the blocks the segments came
-      // from, the batches are what one request will carry.
-      var unitList = batcher.units(segments);
-      var batches = batcher.batchUnits(segments);
-      live.batches = batches.length;
-      live.units = unitList.length;
-      var t0 = performance.now();
-      var stats = newStats();
-      stats.batches = batches.length;
-      var latencies = { t0: t0, firstTranslatedLatencyMs: 0, firstViewportLatencyMs: 0, viewportId: null };
-      segments.forEach(function (s) { if (s.viewport === 1 && !latencies.viewportId) latencies.viewportId = s.id; });
-      log.info(tag + ' packing segments=' + segments.length + ' blocks=' + unitList.length +
-        ' requests=' + batches.length + ' caps=' + batcherCaps.maxSegmentsPerBatch + 'seg/' +
-        batcherCaps.maxEstimatedTokensPerBatch + 'tok first=' + batcherCaps.firstBatchMaxSegments +
-        ' short=' + batcherCaps.maxShortSegmentsPerBatch + '@' + batcherCaps.shortSegmentTokens + 'tok' +
-        ' strategy=' + ((settings.request && settings.request.strategy) || 'multi') +
-        ' (segments/request=' + (batches.length ? (segments.length / batches.length).toFixed(1) : '0') + ')');
-      log.trace(tag + ' batches=' + batches.length + ' ' + batches.map(function (b, i) {
-        return '#' + (i + 1) + ':' + b.segments.length + 'seg/' + b.units + 'blk/' + b.estimatedTokens + 'tok';
-      }).join(' '));
-      live.phase = 'translating';
-      // One port for the whole run: it answers whenever a batch is ready instead
-      // of on a channel that closes under a minutes-long request.
-      openChannel(tag);
-      live.channel = channel ? 'port' : 'sendMessage';
 
-      var promises = batches.map(function (batch, batchIndex) {
-        var btag = tag + ' batch#' + (batchIndex + 1);
-        // This batch's destination: the weighted round-robin over every ticked
-        // API. Its own concurrency rides along so the worker bounds THAT
-        // server's queue, not a global one.
-        var api = apiSchedule[batchIndex % apiSchedule.length];
-        live.apiSplit[api.name] = (live.apiSplit[api.name] || 0) + 1;
-        // Only wire-safe fields cross the boundary; the cache travels as a plain
-        // object limited to this batch (a Map would arrive as "{}").
-        var payload = {
-          id: messaging.makeRequestId('r' + runId + 'b' + (batchIndex + 1)),
-          type: MSG_TRANSLATE,
-          batch: messaging.toWireBatch(batch),
-          profileName: api.name,
-          concurrency: api.concurrency,
-          // No timeoutMs: a batched request answers many segments at once, so the
-          // background scales the timeout with the size of the batch.
-          strategy: (settings.request && settings.request.strategy) || undefined,
-          request: settings.request || undefined,
-          cache: messaging.toWireCache(cache, batch.segments)
-        };
-        live.sent++;
-        live.inFlight++;
-        return sendTranslate(payload).then(function (res) {
-          live.inFlight--;
-          handleBatchResponse(btag, batchIndex + 1, batch, res, segmentsById, stats, latencies);
-        }, function (err) {
-          live.inFlight--;
-          var message = lastErrorMessage(err);
-          countError(stats, 'transport');
-          pushError(stats, message);
-          log.error(btag + ' TRANSPORT FAILURE for ' + batch.segments.length + ' segment(s): ' + message +
-            hintFor(message) + ' :: ' + messaging.summarizeBatch(batch));
-          // Nothing was written, so nothing is lost yet: give the segments a
-          // second chance in requests small enough to answer.
-          return recoverBatch(btag, batchIndex + 1, batch, segmentsById, stats, latencies, api);
+      // The cache that outlives the page (translation/persistent.js): ask
+      // storage about every text this page's session cache does not hold, and
+      // feed the exact matches into that session cache before packing, so the
+      // background answers them as ordinary cache hits and they never cross the
+      // wire. The first request goes out only after that one read answers: a
+      // back-button page should cost milliseconds, not minutes.
+      var persist = persistent();
+      var persistentHits = 0;
+      var prework = null;
+      if (persist) {
+        persist.configure(settings.cache);
+        if (persist.enabled()) {
+          var toAsk = [];
+          var asked = {};
+          segments.forEach(function (seg) {
+            var t = seg.text;
+            if (!t || asked[t] || cache.map.has(t)) return; // the session cache is the hot layer
+            asked[t] = true;
+            toAsk.push(t);
+          });
+          prework = persist.lookup(toAsk).then(function (r) {
+            Object.keys(r.hits).forEach(function (text) { cache.set(text, r.hits[text]); });
+            persistentHits = Object.keys(r.hits).length;
+            if (live) live.persistentHits = persistentHits;
+            if (persistentHits) {
+              log.info(tag + ' persistent cache: ' + persistentHits + ' of ' + r.queried +
+                ' unseen text(s) were translated on an earlier visit' +
+                (r.skipped ? ' (' + r.skipped + ' text(s) too long to look up)' : ''));
+            }
+          });
+        }
+      }
+      // Packing and sending wait for that read; everything below is the run as
+      // it always was, with the persistent hits already inside `cache`.
+      return (prework || Promise.resolve()).then(function () {
+        // One batch = one API request: the units are the blocks the segments
+        // came from, the batches are what one request will carry.
+        var unitList = batcher.units(segments);
+        var batches = batcher.batchUnits(segments);
+        live.batches = batches.length;
+        live.units = unitList.length;
+        var t0 = performance.now();
+        var stats = newStats();
+        stats.batches = batches.length;
+        var latencies = { t0: t0, firstTranslatedLatencyMs: 0, firstViewportLatencyMs: 0, viewportId: null };
+        segments.forEach(function (s) { if (s.viewport === 1 && !latencies.viewportId) latencies.viewportId = s.id; });
+        log.info(tag + ' packing segments=' + segments.length + ' blocks=' + unitList.length +
+          ' requests=' + batches.length + ' caps=' + batcherCaps.maxSegmentsPerBatch + 'seg/' +
+          batcherCaps.maxEstimatedTokensPerBatch + 'tok first=' + batcherCaps.firstBatchMaxSegments +
+          ' short=' + batcherCaps.maxShortSegmentsPerBatch + '@' + batcherCaps.shortSegmentTokens + 'tok' +
+          ' strategy=' + ((settings.request && settings.request.strategy) || 'multi') +
+          ' (segments/request=' + (batches.length ? (segments.length / batches.length).toFixed(1) : '0') + ')');
+        log.trace(tag + ' batches=' + batches.length + ' ' + batches.map(function (b, i) {
+          return '#' + (i + 1) + ':' + b.segments.length + 'seg/' + b.units + 'blk/' + b.estimatedTokens + 'tok';
+        }).join(' '));
+        live.phase = 'translating';
+        // One port for the whole run: it answers whenever a batch is ready instead
+        // of on a channel that closes under a minutes-long request.
+        openChannel(tag);
+        live.channel = channel ? 'port' : 'sendMessage';
+
+        var promises = batches.map(function (batch, batchIndex) {
+          var btag = tag + ' batch#' + (batchIndex + 1);
+          // This batch's destination: the weighted round-robin over every ticked
+          // API. Its own concurrency rides along so the worker bounds THAT
+          // server's queue, not a global one.
+          var api = apiSchedule[batchIndex % apiSchedule.length];
+          live.apiSplit[api.name] = (live.apiSplit[api.name] || 0) + 1;
+          // Only wire-safe fields cross the boundary; the cache travels as a plain
+          // object limited to this batch (a Map would arrive as "{}").
+          var payload = {
+            id: messaging.makeRequestId('r' + runId + 'b' + (batchIndex + 1)),
+            type: MSG_TRANSLATE,
+            batch: messaging.toWireBatch(batch),
+            profileName: api.name,
+            concurrency: api.concurrency,
+            // No timeoutMs: a batched request answers many segments at once, so the
+            // background scales the timeout with the size of the batch.
+            strategy: (settings.request && settings.request.strategy) || undefined,
+            request: settings.request || undefined,
+            cache: messaging.toWireCache(cache, batch.segments)
+          };
+          live.sent++;
+          live.inFlight++;
+          return sendTranslate(payload).then(function (res) {
+            live.inFlight--;
+            handleBatchResponse(btag, batchIndex + 1, batch, res, segmentsById, stats, latencies);
+          }, function (err) {
+            live.inFlight--;
+            var message = lastErrorMessage(err);
+            countError(stats, 'transport');
+            pushError(stats, message);
+            log.error(btag + ' TRANSPORT FAILURE for ' + batch.segments.length + ' segment(s): ' + message +
+              hintFor(message) + ' :: ' + messaging.summarizeBatch(batch));
+            // Nothing was written, so nothing is lost yet: give the segments a
+            // second chance in requests small enough to answer.
+            return recoverBatch(btag, batchIndex + 1, batch, segmentsById, stats, latencies, api);
+          });
         });
-      });
 
-      return Promise.all(promises).then(function () {
-        // Batches are all answered; identical answers get their one retry here,
-        // still inside the run so the summary below reports the real outcome.
-        return retryEchoSegments(tag, apiSchedule, segmentsById, stats, latencies);
-      }).then(function () {
-        closeChannel('run#' + runId + ' finished');
-        var summary = {
-          total: segments.length,
-          translated: stats.translated,
-          failed: stats.failed,
-          cacheHits: stats.cacheHits,
-          applied: stats.applied,
-          skipped: stats.skipped,
-          requests: stats.requests,
-          batches: batches.length,
-          units: unitList.length,
-          // How the run split its batches over the APIs it used.
-          apiSplit: live ? Object.assign({}, live.apiSplit) : null,
-          elapsedMs: Math.round(performance.now() - t0),
-          firstTranslatedLatencyMs: latencies.firstTranslatedLatencyMs,
-          firstViewportLatencyMs: latencies.firstViewportLatencyMs,
-          errorCounts: stats.errorCounts,
-          skipCounts: stats.skipCounts,
-          echoRetried: stats.echoRetried,
-          errors: stats.errors
-        };
-        setStatus('idle');
-        live.phase = 'idle';
-        lastRun = summary;
-        var endLine = tag + ' done total=' + summary.total + ' translated=' + summary.translated +
-          ' applied=' + summary.applied + ' failed=' + summary.failed + ' skipped=' + summary.skipped +
-          ' cacheHits=' + summary.cacheHits + ' requests=' + summary.requests +
-          ' (' + summary.batches + ' request(s) for ' + summary.total + ' segment(s))' +
-          (summary.echoRetried ? ' echo-retried=' + summary.echoRetried : '') +
-          ' in ' + summary.elapsedMs + 'ms' +
-          ' firstTranslated=' + summary.firstTranslatedLatencyMs + 'ms cache=' + cache.map.size;
-        if (summary.failed) log.warn(endLine); else log.info(endLine);
-        if (Object.keys(stats.errorCounts).length) {
-          log.warn(tag + ' failure breakdown ' + JSON.stringify(stats.errorCounts) +
-            ' :: every failure is logged per segment; replay them with __plamo.getLogs({ level: "warn" })');
-        }
-        if (Object.keys(stats.skipCounts).length) {
-          log.warn(tag + ' translated but not written ' + JSON.stringify(stats.skipCounts) +
-            ' :: "changed-after-extract" means the page re-rendered that node ' +
-            '(SPA); "identical" means the model copied the English, retried once ' +
-            '(see the echo#N lines); see __plamo.getApplied() for what did land and ' +
-            '__plamo.getUntranslated() for what is still in English');
-        }
-        return summary;
+        return Promise.all(promises).then(function () {
+          // Batches are all answered; identical answers get their one retry here,
+          // still inside the run so the summary below reports the real outcome.
+          return retryEchoSegments(tag, apiSchedule, segmentsById, stats, latencies);
+        }).then(function () {
+          closeChannel('run#' + runId + ' finished');
+          // Everything this run landed goes to the cache that outlives the page
+          // in ONE write (translation/persistent.js queued it as it landed).
+          var flushed = (persist && persist.enabled()) ? persist.flush() : Promise.resolve({ written: 0 });
+          return flushed.then(function (flushRes) {
+            var summary = {
+              total: segments.length,
+              translated: stats.translated,
+              failed: stats.failed,
+              cacheHits: stats.cacheHits,
+              applied: stats.applied,
+              skipped: stats.skipped,
+              requests: stats.requests,
+              batches: batches.length,
+              units: unitList.length,
+              // What the cache that outlives the page served this run
+              // (persistentHits) and stored for the next page view (persisted).
+              persisted: flushRes.written,
+              persistentHits: persistentHits,
+              // How the run split its batches over the APIs it used.
+              apiSplit: live ? Object.assign({}, live.apiSplit) : null,
+              elapsedMs: Math.round(performance.now() - t0),
+              firstTranslatedLatencyMs: latencies.firstTranslatedLatencyMs,
+              firstViewportLatencyMs: latencies.firstViewportLatencyMs,
+              errorCounts: stats.errorCounts,
+              skipCounts: stats.skipCounts,
+              echoRetried: stats.echoRetried,
+              errors: stats.errors
+            };
+            setStatus('idle');
+            live.phase = 'idle';
+            lastRun = summary;
+            var endLine = tag + ' done total=' + summary.total + ' translated=' + summary.translated +
+              ' applied=' + summary.applied + ' failed=' + summary.failed + ' skipped=' + summary.skipped +
+              ' cacheHits=' + summary.cacheHits + ' requests=' + summary.requests +
+              ' (' + summary.batches + ' request(s) for ' + summary.total + ' segment(s))' +
+              (summary.echoRetried ? ' echo-retried=' + summary.echoRetried : '') +
+              ' persisted=' + summary.persisted + ' persistentHits=' + summary.persistentHits +
+              ' in ' + summary.elapsedMs + 'ms' +
+              ' firstTranslated=' + summary.firstTranslatedLatencyMs + 'ms cache=' + cache.map.size;
+            if (summary.failed) log.warn(endLine); else log.info(endLine);
+            if (Object.keys(stats.errorCounts).length) {
+              log.warn(tag + ' failure breakdown ' + JSON.stringify(stats.errorCounts) +
+                ' :: every failure is logged per segment; replay them with __plamo.getLogs({ level: "warn" })');
+            }
+            if (Object.keys(stats.skipCounts).length) {
+              log.warn(tag + ' translated but not written ' + JSON.stringify(stats.skipCounts) +
+                ' :: "changed-after-extract" means the page re-rendered that node ' +
+                '(SPA); "identical" means the model copied the English, retried once ' +
+                '(see the echo#N lines); see __plamo.getApplied() for what did land and ' +
+                '__plamo.getUntranslated() for what is still in English');
+            }
+            uiEvent('run-end');
+            return summary;
+          });
+        });
       });
     }).catch(function (err) {
       closeChannel('run#' + runId + ' aborted');
       if (live) live.phase = 'idle';
       setStatus('idle');
+      uiEvent('run-abort');
       log.error(tag + ' ABORTED: ' + lastErrorMessage(err) +
         ' stack=' + String((err && err.stack) || '').split('\n').slice(0, 4).join(' | '));
       throw err;
@@ -740,6 +827,22 @@
       else rest++;
     });
     return { visible: visible, near: near, other: rest };
+  }
+
+  // Stop is one action whether it arrives as MSG_STOP (popup/widget) or from
+  // the console (__plamo.stopTranslation()); the widget needs the same event.
+  function stopRun() {
+    abortRequested = true;
+    setStatus('idle');
+    // A reveal of its own starts a NEW run, so a Stop that only paused the
+    // batches in flight would still end up sending requests minutes later.
+    // The waiting list is kept: the next run holds those nodes back again and
+    // resumes watching them (see keepDeferred).
+    stopRevealWatch('stop requested');
+    uiEvent('stop');
+    log.warn('stop requested (run#' + (live ? live.runId : '-') + '); in-flight batches are not cancelled, their results are still applied' +
+      (deferredNodes.length ? '; ' + deferredNodes.length + ' hidden text node(s) stay untranslated and unwatched until the next run' : ''));
+    return Promise.resolve({ ok: true, aborted: true, waitingForDisplay: deferredNodes.length, state: getState() });
   }
 
   function handleMessage(request) {
@@ -759,16 +862,7 @@
       return Promise.resolve({ ok: true, restored: restoredNow, translated: renderer.appliedCount(), state: getState() });
     }
     if (request.type === MSG_STOP) {
-      abortRequested = true;
-      setStatus('idle');
-      // A reveal of its own starts a NEW run, so a Stop that only paused the
-      // batches in flight would still end up sending requests minutes later.
-      // The waiting list is kept: the next run holds those nodes back again and
-      // resumes watching them (see keepDeferred).
-      stopRevealWatch('stop requested');
-      log.warn('stop requested (run#' + (live ? live.runId : '-') + '); in-flight batches are not cancelled, their results are still applied' +
-        (deferredNodes.length ? '; ' + deferredNodes.length + ' hidden text node(s) stay untranslated and unwatched until the next run' : ''));
-      return Promise.resolve({ ok: true, aborted: true, waitingForDisplay: deferredNodes.length, state: getState() });
+      return stopRun();
     }
     if (request.type === MSG_STATUS) {
       return Promise.resolve(getState());
@@ -985,6 +1079,7 @@
     forgetDeferred('restoreAll: nothing is being waited for');
     var restored = restoreNodes(root);
     log.info('restored ' + restored + ' text node(s) to the original text');
+    uiEvent('restore');
     return restored;
   }
 
@@ -1256,6 +1351,9 @@
     pingBackground: pingBackground,
     // actions
     translatePage: function (root, opts) { return translatePage(root, opts); },
+    // The same Stop the widget's button offers mid-run: in-flight batches are
+    // not cancelled, but no new request (not even a reveal) goes out.
+    stopTranslation: function () { return stopRun(); },
     restoreAll: function (root) { return restoreAll(root); },
     // Undo one text node (pass the Text node itself) — console debugging.
     restoreText: function (node) { return restoreNode(node); },
@@ -1266,6 +1364,25 @@
       };
     },
     clearCache: function () { cache.clear(); log.info('session cache cleared'); return cache.map.size; },
+    // The cache that outlives the page (translation/persistent.js). snapshot()
+    // deliberately never enumerates storage - that is what maintain() costs -
+    // so the stored-side counts come from clear() or the DevTools storage pane.
+    getPersistentCache: function () {
+      var p = persistent();
+      if (!p) return { error: 'translation/persistent.js is not loaded' };
+      var snap = p.snapshot();
+      snap.entryPrefix = 'plamo-t-';
+      return snap;
+    },
+    clearPersistentCache: function () {
+      var p = persistent();
+      if (!p) return Promise.resolve({ removed: 0, error: 'translation/persistent.js is not loaded' });
+      return p.clear().then(function (r) {
+        log.info('persistent cache cleared: ' + r.removed + ' stored entry(s) removed, ' +
+          r.pendingDropped + ' not yet written');
+        return r;
+      });
+    },
     getSettings: function () { return settings; },
     translateSegment: function (segment, opts) { return translateSegment(getProfile(settings.profileName), segment, opts); }
   };
