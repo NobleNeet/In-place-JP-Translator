@@ -53,7 +53,20 @@
       charPerToken: 4,
       // The first batch is the visible part of the page: keeping it small is
       // what keeps the perceived speed while later batches go out big.
-      firstBatchMaxSegments: 8
+      firstBatchMaxSegments: 8,
+      // Short segments — menu items, nav labels, headings, buttons — are
+      // numerous and tiny: 24 of them are ~100 estimated tokens, so the token
+      // cap is nowhere near binding and the count cap decides everything.
+      // A segment of at most `shortSegmentTokens` estimated tokens therefore
+      // costs a fraction of one slot of the segment cap, so a batch of nothing
+      // but short segments carries up to `maxShortSegmentsPerBatch` of them.
+      // 72 x ~12 tokens still fits under the 900-token cap, so the per-request
+      // timeout math does not change: short items were always cheap in tokens,
+      // they were only ever expensive in request count. Mixed batches pay the
+      // fractional slots, so short items fill the gaps between paragraphs.
+      // Set it <= maxSegmentsPerBatch to turn the discount off.
+      shortSegmentTokens: 12,
+      maxShortSegmentsPerBatch: 72
     },
 
     // 'multi'  = one request per batch (fast, this is the default now)

@@ -36,7 +36,7 @@ plamo-page-translator/
 │   └── openai-client.js     # OpenAI-compatible client (swap-able later)
 ├── translation/
 │   ├── queue.js             # ordered queue
-│   ├── batcher.js           # packs DOM blocks into API requests (count + token caps)
+│   ├── batcher.js           # packs DOM blocks into API requests (count/slot + token caps)
 │   ├── scheduler.js         # concurrency semaphore (one per API profile)
 │   └── cache.js             # session in-memory cache
 ├── shared/
@@ -266,6 +266,16 @@ All of these are in the popup and apply to the **next** "Translate Page" press.
   the decoding — a model still writes the answers one after another, so a request
   costs roughly the sum of its segments and a big cap buys nothing but a big
   blast radius when one request dies.
+- **Short segments ride together** (`shortSegmentTokens` default 12,
+  `maxShortSegmentsPerBatch` default 72 — constants, not popup): a segment of
+  at most 12 estimated tokens — a menu item, a nav label, a heading, a button —
+  costs a fraction (1/3) of one slot of the segment cap, so a wall of them
+  fills **one** request with up to 72 lines instead of costing one request per
+  24. Mixed batches pay the fractional slots too, so short items fill the gaps
+  between paragraphs. The 900-token cap still bounds every request, and with
+  it the per-request timeout: short items were only ever expensive in request
+  **count**, never in tokens. Turn the discount off by setting
+  `maxShortSegmentsPerBatch` less than or equal to `maxSegmentsPerBatch`.
 - **Request packing**: `multi` (default — one request per batch, one text node
   per line) or `single` (one request per text node, i.e. the previous
   behaviour, kept for A/B comparison).

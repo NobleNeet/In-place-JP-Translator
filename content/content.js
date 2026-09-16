@@ -621,6 +621,7 @@
       log.info(tag + ' packing segments=' + segments.length + ' blocks=' + unitList.length +
         ' requests=' + batches.length + ' caps=' + batcherCaps.maxSegmentsPerBatch + 'seg/' +
         batcherCaps.maxEstimatedTokensPerBatch + 'tok first=' + batcherCaps.firstBatchMaxSegments +
+        ' short=' + batcherCaps.maxShortSegmentsPerBatch + '@' + batcherCaps.shortSegmentTokens + 'tok' +
         ' strategy=' + ((settings.request && settings.request.strategy) || 'multi') +
         ' (segments/request=' + (batches.length ? (segments.length / batches.length).toFixed(1) : '0') + ')');
       log.trace(tag + ' batches=' + batches.length + ' ' + batches.map(function (b, i) {

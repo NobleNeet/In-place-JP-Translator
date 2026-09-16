@@ -188,14 +188,16 @@ async function main() {
   ok('paragraph fragments are one unit', pUnits.length === 9 && pUnits[0].segments.length === 3);
   ok('11 blocks packed into 1 request', pBatches.length === 1 && pBatches[0].segments.length === 11, pBatches.map((b) => b.segments.length));
   ok('batch reports its block count', pBatches[0].units === 9);
-  const tight = ns.createBatcher({ maxSegmentsPerBatch: 4, maxEstimatedTokensPerBatch: 100000, firstBatchMaxSegments: 4 });
+  // These cap-mechanics tests want one slot per segment, so they turn the
+  // short-segment discount off (maxShortSegmentsPerBatch <= maxSegmentsPerBatch).
+  const tight = ns.createBatcher({ maxSegmentsPerBatch: 4, maxEstimatedTokensPerBatch: 100000, firstBatchMaxSegments: 4, maxShortSegmentsPerBatch: 4 });
   const tightB = tight.batchUnits(structSegs);
   ok('segment cap still respected', tightB.every((b) => b.segments.length <= 4) &&
     tightB.reduce((a, b) => a + b.segments.length, 0) === 11, tightB.map((b) => b.segments.length));
   const tightHead = tight.batchUnits(structSegs.slice(0, 5))[0].segments.map((s) => s.id).join(',');
   ok('a block is never split below its own size', tightHead === 'p0,p1,p2,m0', tightHead);
   // First-batch cap: the visible area should not wait for a full-sized request.
-  const firstSmall = ns.createBatcher({ maxSegmentsPerBatch: 48, maxEstimatedTokensPerBatch: 100000, firstBatchMaxSegments: 2 });
+  const firstSmall = ns.createBatcher({ maxSegmentsPerBatch: 48, maxEstimatedTokensPerBatch: 100000, firstBatchMaxSegments: 2, maxShortSegmentsPerBatch: 48 });
   const fsPlain = firstSmall.batchUnits(structSegs.map((s) => ({ id: s.id, text: s.text, source: {} })));
   ok('first batch stays small, later ones go out big',
     fsPlain.length === 2 && fsPlain[0].segments.length === 2 && fsPlain[1].segments.length === 9,
@@ -203,16 +205,59 @@ async function main() {
   const fsBlocks = firstSmall.batchUnits(structSegs);
   ok('a block bigger than the first cap is not split', fsBlocks[0].segments.length === 3 && fsBlocks[1].segments.length === 8,
     fsBlocks.map((b) => b.segments.length));
-  const noBlocks = ns.createBatcher({ maxSegmentsPerBatch: 3, maxEstimatedTokensPerBatch: 100000 });
+  const noBlocks = ns.createBatcher({ maxSegmentsPerBatch: 3, maxEstimatedTokensPerBatch: 100000, maxShortSegmentsPerBatch: 3 });
   const nb = noBlocks.batchUnits(structSegs.map((s) => ({ id: s.id, text: s.text, source: {} })));
   ok('segments without block info still pack', nb.length === 4 && nb[0].segments.length === 3);
-  const oneSeg = ns.createBatcher({ maxSegmentsPerBatch: 1, maxEstimatedTokensPerBatch: 100000 });
+  const oneSeg = ns.createBatcher({ maxSegmentsPerBatch: 1, maxEstimatedTokensPerBatch: 100000, maxShortSegmentsPerBatch: 1 });
   ok('a tight popup setting survives the first-batch cap', oneSeg.caps().firstBatchMaxSegments === 1, oneSeg.caps());
   ok('one segment per request, except a paragraph that needs 3',
     oneSeg.batchUnits(structSegs).map((b) => b.segments.length).join(',') === '3,1,1,1,1,1,1,1,1',
     oneSeg.batchUnits(structSegs).map((b) => b.segments.length));
   ok('the packer reports its own caps', ns.createBatcher({ maxSegmentsPerBatch: 7, maxEstimatedTokensPerBatch: 90,
     firstBatchMaxSegments: 3, charPerToken: 5 }).caps().maxSegmentsPerBatch === 7);
+
+  console.log('== batcher: short segments (menus, headings) ride together ==');
+  // A wall of 100 menu items: before the short-segment discount these cost one
+  // request per 24; now the count cap is measured in slots and short items fill
+  // one request to maxShortSegmentsPerBatch. The first batch is discounted too,
+  // so the visible menu lands in the first request.
+  const wall = [];
+  for (let i = 0; i < 100; i++) wall.push({ id: 'w' + i, text: 'Menu item ' + i, block: 'w' + i, container: 'wall', source: {} });
+  const wallPacker = ns.createBatcher({});
+  const wallCaps = wallPacker.caps();
+  ok('the default discount is on', wallCaps.maxShortSegmentsPerBatch === 72 && wallCaps.shortSegmentTokens === 12 &&
+    wallCaps.shortSegmentCost > 0 && wallCaps.shortSegmentCost < 1, wallCaps);
+  const wallBatches = wallPacker.batchUnits(wall);
+  ok('short wall: first batch discounted too, then 72 per request',
+    wallBatches.map((bt) => bt.segments.length).join(',') === '24,72,4',
+    wallBatches.map((bt) => bt.segments.length));
+  const noFirst = ns.createBatcher({ firstBatchMaxSegments: 24 });
+  ok('a short-only batch fills exactly the short cap, not one more',
+    noFirst.batchUnits(wall).map((bt) => bt.segments.length).join(',') === '72,28');
+  // The discount buys request COUNT, not request size: the token cap still
+  // bounds how much one request carries, so the timeout math is unchanged.
+  const tightTok = ns.createBatcher({ maxEstimatedTokensPerBatch: 50, firstBatchMaxSegments: 24 });
+  const tokWall = tightTok.batchUnits(wall);
+  ok('the token cap still splits short batches',
+    tokWall.every((bt) => bt.estimatedTokens <= 50 && bt.segments.length <= 16) &&
+    tokWall.reduce((n, bt) => n + bt.segments.length, 0) === 100 &&
+    tokWall[0].segments.length === 16 && tokWall.length > wallBatches.length,
+    tokWall.map((bt) => bt.segments.length + 'seg/' + bt.estimatedTokens + 'tok'));
+  const longs = [];
+  for (let i = 0; i < 30; i++) longs.push({ id: 'l' + i, text: 'l'.repeat(60) + i, block: 'l' + i, container: 'c', source: {} });
+  ok('a long segment still pays a full slot',
+    ns.createBatcher({ firstBatchMaxSegments: 24 }).batchUnits(longs).map((bt) => bt.segments.length).join(',') === '24,6');
+  // 20 long segments leave exactly 4 slots, which 12 short items fill: mixed
+  // batches pack the short items into the gaps between paragraphs.
+  const mixed = longs.slice(0, 20).concat(wall.slice(0, 12));
+  const mixedBatches = ns.createBatcher({ firstBatchMaxSegments: 24 }).batchUnits(mixed);
+  ok('short items fill the fractional slots a long batch leaves',
+    mixedBatches.length === 1 && mixedBatches[0].segments.length === 32,
+    mixedBatches.map((bt) => bt.segments.length));
+  const offPacker = ns.createBatcher({ firstBatchMaxSegments: 24, maxShortSegmentsPerBatch: 24 });
+  ok('turning the discount off restores one request per 24',
+    offPacker.batchUnits(wall).map((bt) => bt.segments.length).join(',') === '24,24,24,24,4' &&
+    offPacker.caps().shortSegmentCost === 1, offPacker.caps());
 
   console.log('== semaphore ==');
   async function testConcurrency(max, n) { const sem = new ns.Semaphore(max); var maxObs = 0, active = 0;

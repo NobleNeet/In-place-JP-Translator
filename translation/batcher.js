@@ -10,6 +10,14 @@
 // units of the same container (the items of a menu or a list) are filled into
 // one request together — that is how a wall of short menu items ends up as one
 // request instead of one request per item.
+//
+// The segment cap is measured in slots, not in segments: a segment of at most
+// `shortSegmentTokens` estimated tokens (a menu item, a nav label, a heading)
+// costs less than one slot, so a batch of nothing but short segments may carry
+// `maxShortSegmentsPerBatch` of them while a batch of paragraphs still stops
+// after `maxSegmentsPerBatch`. The token cap still bounds every request, which
+// is what keeps the per-request timeout math unchanged. Pass
+// maxShortSegmentsPerBatch <= maxSegmentsPerBatch to turn the discount off.
 (function () {
   var ns = globalThis.__PLAMO__;
   var BATCH_SETTINGS = ns.constants.BATCH_SETTINGS;
@@ -24,6 +32,22 @@
     var firstMax = opts && opts.firstBatchMaxSegments != null
       ? opts.firstBatchMaxSegments : (BATCH_SETTINGS.firstBatchMaxSegments == null
         ? maxSegmentsPerBatch : BATCH_SETTINGS.firstBatchMaxSegments);
+    var shortTokens = opts && opts.shortSegmentTokens != null
+      ? opts.shortSegmentTokens : BATCH_SETTINGS.shortSegmentTokens;
+    var maxShort = opts && opts.maxShortSegmentsPerBatch != null
+      ? opts.maxShortSegmentsPerBatch : BATCH_SETTINGS.maxShortSegmentsPerBatch;
+    // One short segment costs `shortSlot` thousandths of one of the
+    // maxSegmentsPerBatch slots. Integer thousandths, not floats: 72 x 1/3
+    // accumulated in binary floats lands just under 24 and would let one more
+    // item in per batch, every batch. Rounding the slot down keeps a
+    // short-only batch at exactly the short cap.
+    var shortSlot = (shortTokens > 0 && maxShort > maxSegmentsPerBatch)
+      ? Math.max(1, Math.floor(1000 * maxSegmentsPerBatch / maxShort)) : 1000;
+
+    function segmentSlots(seg) {
+      return (shortSlot < 1000 && estimateTokens(seg ? seg.text : '') <= shortTokens)
+        ? shortSlot : 1000;
+    }
 
     function estimateTokens(text) {
       var len = String(text || '').length;
@@ -45,12 +69,14 @@
         if (last && key != null && last.block === key) {
           last.segments.push(seg);
           last.tokens += estimateTokens(seg.text);
+          last.slots += segmentSlots(seg);
         } else {
           out.push({
             block: key,
             container: (seg && seg.container != null) ? String(seg.container) : null,
             segments: [seg],
-            tokens: estimateTokens(seg.text)
+            tokens: estimateTokens(seg.text),
+            slots: segmentSlots(seg)
           });
         }
       }
@@ -63,22 +89,31 @@
       var cur = null;
 
       function open() {
-        cur = { segments: [], estimatedTokens: 0, units: 0, blocks: [] };
+        cur = { segments: [], estimatedTokens: 0, units: 0, blocks: [], slots: 0 };
         batches.push(cur);
       }
-      // Only the first batch is capped small: it is the visible part of the
-      // page, so shipping it early is what keeps the page feeling fast.
-      function capSegments() {
-        return batches.length <= 1 ? Math.min(maxSegmentsPerBatch, firstMax) : maxSegmentsPerBatch;
+      // Caps in slot thousandths, so the comparison stays exact. Only the
+      // first batch is capped small: it is the visible part of the page, so
+      // shipping it early is what keeps the page feeling fast. The first cap
+      // is discounted like every other one: a first batch of nothing but short
+      // items is many lines but little decoding, which is still a fast answer.
+      function capSlots() {
+        return (batches.length <= 1 ? Math.min(maxSegmentsPerBatch, firstMax) : maxSegmentsPerBatch) * 1000;
       }
       function addSegment(seg) {
         cur.segments.push(seg);
         cur.estimatedTokens += estimateTokens(seg.text);
+        cur.slots += segmentSlots(seg);
       }
 
       for (var i = 0; i < unitList.length; i++) {
         var unit = unitList[i];
         if (!cur) open();
+        // Only the token cap cuts a unit: a block of many short segments is
+        // still one request of short lines the model digests happily, while a
+        // unit whose *tokens* exceed the cap physically cannot answer inside
+        // one request. A unit merely over a count cap (the first batch's
+        // smaller one, or an unusually chatty <p>) is carried whole.
         if (unit.tokens > maxTokensPerBatch) {
           // Too big for one request even on its own: split the unit itself,
           // whole segments at a time, so a long paragraph still gets translated.
@@ -86,7 +121,7 @@
             var seg = unit.segments[k];
             var tok = estimateTokens(seg.text);
             if (cur.segments.length &&
-              (cur.segments.length >= capSegments() || cur.estimatedTokens + tok > maxTokensPerBatch)) open();
+              (cur.slots >= capSlots() || cur.estimatedTokens + tok > maxTokensPerBatch)) open();
             addSegment(seg);
           }
           cur.units++;
@@ -94,7 +129,7 @@
           continue;
         }
         if (cur.segments.length &&
-          (cur.segments.length + unit.segments.length > capSegments() ||
+          (cur.slots + unit.slots > capSlots() ||
             cur.estimatedTokens + unit.tokens > maxTokensPerBatch)) open();
         for (var m = 0; m < unit.segments.length; m++) addSegment(unit.segments[m]);
         cur.units++;
@@ -104,8 +139,9 @@
       return batches.filter(function (b) { return b.segments.length > 0; });
     }
 
-    // Count-only packing, kept for callers that build segments without any DOM
-    // grouping information.
+    // Count-only packing — and count here really means segments, slots and the
+    // short-segment discount do not apply. Kept for callers that build segments
+    // without any DOM grouping information; the wire path is batchUnits().
     function batch(segments) {
       var batches = [];
       var i = 0;
@@ -174,7 +210,13 @@
           maxSegmentsPerBatch: maxSegmentsPerBatch,
           maxEstimatedTokensPerBatch: maxTokensPerBatch,
           firstBatchMaxSegments: Math.min(maxSegmentsPerBatch, firstMax),
-          charPerToken: charPerToken
+          charPerToken: charPerToken,
+          // The short-segment discount as it was actually built: cost 1 means
+          // the discount is off, otherwise short segments cost this many slots
+          // and a short-only batch holds up to maxShortSegmentsPerBatch.
+          shortSegmentTokens: shortTokens,
+          maxShortSegmentsPerBatch: shortSlot < 1000 ? maxShort : maxSegmentsPerBatch,
+          shortSegmentCost: shortSlot / 1000
         };
       }
     };

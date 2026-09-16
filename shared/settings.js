@@ -21,7 +21,9 @@
         maxSegmentsPerBatch: C.BATCH_SETTINGS.maxSegmentsPerBatch,
         maxEstimatedTokensPerBatch: C.BATCH_SETTINGS.maxEstimatedTokensPerBatch,
         charPerToken: C.BATCH_SETTINGS.charPerToken,
-        firstBatchMaxSegments: C.BATCH_SETTINGS.firstBatchMaxSegments
+        firstBatchMaxSegments: C.BATCH_SETTINGS.firstBatchMaxSegments,
+        shortSegmentTokens: C.BATCH_SETTINGS.shortSegmentTokens,
+        maxShortSegmentsPerBatch: C.BATCH_SETTINGS.maxShortSegmentsPerBatch
       },
       // How segments are packed into API requests (see api/openai-client.js).
       request: {
