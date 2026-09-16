@@ -71,7 +71,10 @@ function makePortPair(name) {
 
 const chromeFake = {
   storage: { local: {
-    get: async () => Object.assign({}, _d),
+    // A fresh deep copy on every read: real storage hands back deserialised
+    // values, so a module that mutates what it read must not look as if it had
+    // written anything.
+    get: async () => JSON.parse(JSON.stringify(_d)),
     set: async (o) => { Object.assign(_d, o); },
     remove: async (keys) => { (Array.isArray(keys) ? keys : [keys]).forEach((k) => { delete _d[k]; }); }
   } },
@@ -825,7 +828,9 @@ async function main() {
   const pcCollide = await pc.lookup([pcText1]);
   ok('a colliding key never mistranslates: the stored source must equal the text',
     pcCollide.hits[pcText1] === undefined, pcCollide);
-  // maintain() trims to 90% of the caps, oldest (`at`) first.
+  // maintain() trims to 90% of the caps. None of these was ever reused, so the
+  // order here is the plain oldest (`at`) first the store had before reuses were
+  // counted; the section below adds the reuses that change it.
   const trimOld = 'Oldest remembered wording kept for the trim test.';
   const trimMid = 'Middle remembered wording kept for the trim test.';
   const trimNew = 'Newest remembered wording kept for the trim test.';
@@ -837,7 +842,7 @@ async function main() {
   await pc.flush();
   pc.configure({ maxEntries: 2 });
   const trimmed = await pc.maintain();
-  ok('maintain() trims oldest-first down to the cap', trimmed === 4, trimmed);
+  ok('maintain() trims to the cap, unused entries oldest first', trimmed === 4, trimmed);
   const afterTrim = await pc.lookup([trimOld, trimMid, trimNew]);
   ok('only the newest entry survives the trim',
     afterTrim.hits[trimNew] === 'C' && afterTrim.hits[trimOld] === undefined &&
@@ -845,6 +850,52 @@ async function main() {
   pc.configure({});
   const cleared = await pc.clear();
   ok('clear() removes every stored entry and reports it', cleared.removed === 1, cleared);
+
+  console.log('\n== the trim keeps what keeps being used ==');
+  // The caps decide WHEN the store is trimmed; what decides the order is how
+  // much work an entry has done since it was last asked for. Day-scale ages are
+  // written by hand, because a test run cannot age anything by waiting.
+  const DAY = 86400000;
+  const stamp = Date.now();
+  const hot = 'A nav label every page of the site carries.';
+  const warm = 'A paragraph read once, five days ago.';
+  const cold = 'A paragraph read once, ten days ago.';
+  const putEntry = (text, e) => chromeFake.storage.local.set({
+    [pc.entryKey(text)]: Object.assign({ s: text, t: '訳' }, e)
+  });
+  await putEntry(hot, { at: stamp - 60 * DAY, used: stamp - 2 * DAY, n: 59 });
+  await putEntry(warm, { at: stamp - 5 * DAY });
+  await putEntry(cold, { at: stamp - 10 * DAY });
+  pc.configure({ maxEntries: 3 }); // the trim aims at 90%, so two of the three survive
+  const byUse = await pc.maintain();
+  const stillThere = await pc.lookup([hot, warm, cold]);
+  ok('a sixty-day-old entry in daily use outlives a ten-day-old one read once',
+    byUse === 1 && stillThere.hits[cold] === undefined &&
+    stillThere.hits[hot] !== undefined && stillThere.hits[warm] !== undefined,
+    [byUse, Object.keys(stillThere.hits)]);
+
+  // A hit is an entry earning its keep, so it is counted — at most once per
+  // `useLogIntervalMs`, because the counter lives in storage and a hit that
+  // cannot be written is a hit the next trim never saw.
+  pc.configure({});
+  await pc.clear();
+  const counted = 'Counted once per logging interval.';
+  await putEntry(counted, { at: stamp - 2 * ns.constants.CACHE_SETTINGS.useLogIntervalMs });
+  const firstHit = await pc.lookup([counted]);
+  ok('a hit on an entry that has been idle long enough is counted', firstHit.reused === 1, firstHit);
+  const secondHit = await pc.lookup([counted]);
+  ok('the next hit inside the interval is answered, but not counted twice',
+    Object.keys(secondHit.hits).length === 1 && secondHit.reused === 0, secondHit);
+  const countedBefore = (await chromeFake.storage.local.get([pc.entryKey(counted)]))[pc.entryKey(counted)];
+  ok('a counted hit does not rewrite the entry: no new `at`, no reset counters',
+    countedBefore.at === stamp - 2 * ns.constants.CACHE_SETTINGS.useLogIntervalMs &&
+    countedBefore.n === undefined, countedBefore);
+  const wroteCount = await pc.flush();
+  const countedAfter = (await chromeFake.storage.local.get([pc.entryKey(counted)]))[pc.entryKey(counted)];
+  ok('the run writes the counters back with its one ordinary write',
+    wroteCount.written === 0 && wroteCount.reused === 1 && countedAfter.n === 1 &&
+    countedAfter.used >= stamp, [wroteCount, countedAfter]);
+  await pc.clear();
 
   console.log('\nRESULT: ' + pass + ' passed, ' + fail + ' failed');
   process.exit(fail === 0 ? 0 : 1);

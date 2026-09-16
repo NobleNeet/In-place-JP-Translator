@@ -673,6 +673,7 @@
             if (persistentHits) {
               log.info(tag + ' persistent cache: ' + persistentHits + ' of ' + r.queried +
                 ' unseen text(s) were translated on an earlier visit' +
+                (r.reused ? ', ' + r.reused + ' reuse(s) counted' : '') +
                 (r.skipped ? ' (' + r.skipped + ' text(s) too long to look up)' : ''));
             }
           });

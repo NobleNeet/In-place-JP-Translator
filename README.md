@@ -424,9 +424,22 @@ page opened in a second tab, then costs only the text nobody has ever translated
   looked up in a single `storage.get` before the first request goes out, and
   everything the run applied is written back in a single `storage.set`.
 - **Capped and trimmed** (`CACHE_SETTINGS` in `shared/constants.js`): past
-  `maxEntries`/`maxChars`, `maintain()` removes the oldest entries first. The
-  store lives under the `plamo-t-` key prefix; `__plamo.clearPersistentCache()`
-  empties it, and `settings.cache.enabled: false` turns the layer off.
+  `maxEntries`/`maxChars`, `maintain()` trims the store back to 90% of both
+  caps. The store lives under the `plamo-t-` key prefix;
+  `__plamo.clearPersistentCache()` empties it, and `settings.cache.enabled:
+  false` turns the layer off.
+- **Used often = kept longer.** Every entry carries how many lookups it has
+  answered (`n`) and when it last answered one (`used`), and the trim removes
+  whichever has aged the most since then, divided by one more for each reuse:
+  a translation kept in use ages `(1 + reuses)` times more slowly. The nav label
+  a site answers on every page view therefore outlives an article paragraph
+  nobody opens twice, an entry that was never reused still goes oldest-first,
+  and nothing is immortal — its age only accrues slower. Reuses are recorded at
+  most once per `useLogIntervalMs` per entry (a reuse is a storage write, and a
+  page re-rendered every second must not rewrite the hundreds of texts it just
+  answered); they ride along in the run's one ordinary write, and a text the
+  run only re-applied from storage is not stored again. Entries written before
+  the counters existed simply have none, and age from their stored `at`.
 
 ### When a paragraph stays in English
 

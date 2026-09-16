@@ -134,11 +134,20 @@
     CACHE_SETTINGS: {
       enabled: true,
       // chrome.storage.local holds 10 MB without the "unlimitedStorage"
-      // permission, so the store is trimmed to these caps (oldest entries
-      // first) once a run has stored `maintainAfterChars` of new text.
+      // permission, so the store is trimmed to these caps once a run has
+      // stored `maintainAfterChars` of new text. The trim drops the entries
+      // that have aged the most since they were last used, divided by how
+      // often they have been used, so frequently reused translations are the
+      // last things removed (see translation/persistent.js).
       maxEntries: 40000,
       maxChars: 3000000,      // counted over source + translation
-      maintainAfterChars: 200000
+      maintainAfterChars: 200000,
+      // A lookup hit records a reuse, and a reuse is a storage write. This is
+      // how often one entry's counters may be rewritten: an hour is far finer
+      // than the day-scale the trim works on, and it stops a page re-rendered
+      // every second from rewriting its few hundred known texts every second.
+      // 0 = record every hit.
+      useLogIntervalMs: 3600000
     },
 
     // Extraction unit is a Text node (never an element): see content/extractor.js.

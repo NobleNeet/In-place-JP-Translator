@@ -671,7 +671,10 @@ sandbox.chrome = {
     }
   },
   storage: { local: {
-    get: async () => Object.assign({}, stored),
+    // A fresh deep copy on every read: real storage hands back deserialised
+    // values, so a module that mutates what it read must not appear to have
+    // written anything.
+    get: async () => JSON.parse(JSON.stringify(stored)),
     set: async (o) => Object.assign(stored, o),
     remove: async (keys) => { (Array.isArray(keys) ? keys : [keys]).forEach((k) => { delete stored[k]; }); }
   } }
@@ -878,9 +881,13 @@ const putSettings = (patch) => sandbox.chrome.storage.local.set(patch);
     bg.requests === reqBeforePC + 2 && runPC1.applied === 2 && runPC1.persisted === 2,
     [bg.requests - reqBeforePC, runPC1.applied, runPC1.persisted]);
   const pcKeys = () => Object.keys(stored).filter((k) => k.indexOf('plamo-t-') === 0);
+  const pcEntry = (text) => stored[ns.persistentCache.entryKey(text)];
   ok('the entries are in storage, and the queue is written out empty',
     pcKeys().length === 2 && api.getPersistentCache().pending === 0,
     [pcKeys().length, api.getPersistentCache()]);
+  const pcAtOne = pcEntry('Remembered across pages one').at;
+  ok('a stored translation starts with no reuses', pcEntry('Remembered across pages one').n === 0,
+    pcEntry('Remembered across pages one'));
 
   // The page is put back to English and the SESSION cache is cleared, so from
   // here only the persistent one can answer. This is the back-button shape.
@@ -895,32 +902,65 @@ const putSettings = (patch) => sandbox.chrome.storage.local.set(patch);
     pcNodes.map((n) => n.nodeValue));
   ok('both cache layers report the hits', runPC2.cacheHits >= 2 && runPC2.persistentHits >= 2,
     [runPC2.cacheHits, runPC2.persistentHits]);
+  ok('a hit is not re-stored: the entry keeps the `at` it was written with',
+    pcEntry('Remembered across pages one').at === pcAtOne,
+    [pcEntry('Remembered across pages one').at, pcAtOne]);
 
   const pcNear = await ns.persistentCache.lookup(['Remembered across pages onx']);
   ok('a one-character difference is not a match, not even from storage',
     Object.keys(pcNear.hits).length === 0, pcNear);
 
-  // One more fresh text, then cap the store at two entries: maintain() trims
-  // oldest-first, so only the newest translation is left standing.
+  // --- a reuse is what buys an entry its keep ----------------------------------
+  // The trim order (below) is decided by how often an entry answered, so the
+  // counting itself is worth pinning: a hit is written back with the run's one
+  // write, and only once per `useLogIntervalMs` per entry.
+  // Hand-age it: an entry stored a moment ago has not earned a counted reuse yet.
+  pcEntry('Remembered across pages one').at = Date.now() - 2 * ns.constants.CACHE_SETTINGS.useLogIntervalMs;
+  const pcRe = await ns.persistentCache.lookup(['Remembered across pages one']);
+  const pcReuseWrite = await ns.persistentCache.flush();
+  ok('past the logging interval the next hit is counted, and written back',
+    Object.keys(pcRe.hits).length === 1 && pcReuseWrite.reused === 1 &&
+    pcEntry('Remembered across pages one').n === 1,
+    [pcReuseWrite, pcEntry('Remembered across pages one')]);
+  const pcThird = await ns.persistentCache.lookup(['Remembered across pages one']);
+  ok('a third hit straight after it is not counted again',
+    Object.keys(pcThird.hits).length === 1 && pcEntry('Remembered across pages one').n === 1,
+    pcEntry('Remembered across pages one'));
+
+  // One more fresh text through the ordinary path, so the store holds three.
   const pcLateBox = E('div', {}, E('p', {}, 'Trimmed old text three'));
   mainEl.appendChild(pcLateBox);
-  await sleep(10); // a distinct `at`, so the trim below has an unambiguous order
   await api.translatePage(pcLateBox);
-  ns.persistentCache.configure({ maxEntries: 2 });
+  ok('a later run adds its own translation to the store', pcKeys().length === 3, pcKeys().length);
+
+  // --- trim order: reuse buys life -------------------------------------------
+  // A run of a few milliseconds cannot age anything, and a trim that only ever
+  // removed the newest entry would throw away the `About us` a site answers on
+  // every page view before the article paragraph nobody reads twice. So: build
+  // the store by hand at day-scale separations, cap it at three entries (the
+  // trim aims at 90% of that, so two survive), and see which one goes.
+  await api.clearPersistentCache();
+  const DAY = 86400000;
+  const nowMs = Date.now();
+  const put = (text, e) => { stored[ns.persistentCache.entryKey(text)] = Object.assign({ s: text, t: 'ヤク' }, e); };
+  put('Read once ten days ago', { at: nowMs - 10 * DAY });
+  put('Read once five days ago', { at: nowMs - 5 * DAY });
+  put('Reused every day since', { at: nowMs - 60 * DAY, used: nowMs - 2 * DAY, n: 59 });
+  ns.persistentCache.configure({ maxEntries: 3 });
   const pcTrimmed = await ns.persistentCache.maintain();
-  ok('maintain() trims the store to its cap, oldest first', pcTrimmed === 2, pcTrimmed);
-  const pcGone = await ns.persistentCache.lookup(['Remembered across pages one', 'Remembered across pages two']);
-  const pcKept = await ns.persistentCache.lookup(['Trimmed old text three']);
-  ok('the trimmed entries answer as misses, the newest still answers',
-    Object.keys(pcGone.hits).length === 0 && Object.keys(pcKept.hits).length === 1,
-    [pcGone.hits, pcKept.hits]);
+  const pcGone = await ns.persistentCache.lookup(['Read once ten days ago']);
+  const pcKept = await ns.persistentCache.lookup(['Read once five days ago', 'Reused every day since']);
+  ok('the trim keeps to its cap and removes exactly one entry', pcTrimmed === 1, pcTrimmed);
+  ok('sixty days old but in daily use, an entry outlives one read once ten days ago',
+    Object.keys(pcGone.hits).length === 0 && Object.keys(pcKept.hits).length === 2,
+    [Object.keys(pcGone.hits), Object.keys(pcKept.hits)]);
   const stubbornKeys = pcKeys().filter((k) => stored[k].s === 'Stubborn wording here');
   ok('a copied answer never enters the cache that outlives the page',
     stubbornKeys.length === 0, stubbornKeys);
   ns.persistentCache.configure({});
   const pcCleared = await api.clearPersistentCache();
   ok('__plamo.clearPersistentCache() empties the store',
-    pcCleared.removed === 1 && pcKeys().length === 0, pcCleared);
+    pcCleared.removed === 2 && pcKeys().length === 0, pcCleared);
 
 })().then(finish, function (err) {
   fail++;

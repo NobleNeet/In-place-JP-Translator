@@ -34,13 +34,16 @@
         batchSystemPrompt: C.REQUEST_SETTINGS.batchSystemPrompt
       },
       // The exact-match translation cache that outlives the page
-      // (translation/persistent.js): caps of chrome.storage.local, oldest
-      // entries trimmed first. The session cache stays the hot layer in front.
+      // (translation/persistent.js): caps of chrome.storage.local, and how
+      // often one entry's reuse counters may be rewritten, which is what
+      // decides the order the caps trim in. The session cache stays the hot
+      // layer in front.
       cache: {
         enabled: C.CACHE_SETTINGS.enabled,
         maxEntries: C.CACHE_SETTINGS.maxEntries,
         maxChars: C.CACHE_SETTINGS.maxChars,
-        maintainAfterChars: C.CACHE_SETTINGS.maintainAfterChars
+        maintainAfterChars: C.CACHE_SETTINGS.maintainAfterChars,
+        useLogIntervalMs: C.CACHE_SETTINGS.useLogIntervalMs
       },
       // Which text a run sends first, and what it holds back (content/priority.js).
       priority: {
@@ -67,7 +70,8 @@
         enabled: booleanWith((patch.cache || {}).enabled, base.cache.enabled),
         maxEntries: clampMs((patch.cache || {}).maxEntries, base.cache.maxEntries, 1, 200000),
         maxChars: clampMs((patch.cache || {}).maxChars, base.cache.maxChars, 1000, 100000000),
-        maintainAfterChars: clampMs((patch.cache || {}).maintainAfterChars, base.cache.maintainAfterChars, 1000, 100000000)
+        maintainAfterChars: clampMs((patch.cache || {}).maintainAfterChars, base.cache.maintainAfterChars, 1000, 100000000),
+        useLogIntervalMs: clampMs((patch.cache || {}).useLogIntervalMs, base.cache.useLogIntervalMs, 0, 86400000)
       }),
       priority: Object.assign({}, base.priority, (patch.priority || {}), {
         // The numbers are clamped, not trusted: a stored typo must not turn the
