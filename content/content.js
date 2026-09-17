@@ -572,10 +572,13 @@
     chunks.forEach(function (chunkBatch, ci) {
       chain = chain.then(function () {
         if (abortRequested) return;
-        // This round is deliberately one request at a time, but which server gets
-        // one is still decided now rather than back at packing time: after a run,
-        // one of the two is usually much emptier than the other.
-        var api = (dispatcher && dispatcher.pickRoomiest()) ||
+        // This round is deliberately one request at a time, but the chunks are
+        // shared round-robin between the ticked APIs rather than all going to
+        // one of them. After the main run every server is equally idle, so a
+        // "pick the emptiest" rule always names the same server and that one
+        // API grinds through the whole tail while the other waits with nothing
+        // to do. Alternating by chunk index keeps both APIs fed.
+        var api = (dispatcher && dispatcher.pickRoundRobin(ci)) ||
           { name: settings.profileName, concurrency: settings.maxConcurrent };
         var btag = tag + ' echo#' + (ci + 1);
         var payload = {

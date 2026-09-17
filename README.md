@@ -123,6 +123,16 @@ select. Tick several and one "Translate Page" run sends its batches through
   simply ends up with fewer batches; the work that has not started belongs to no
   server, and an idle one is never left waiting for a job somebody else dealt
   itself out. Nothing is decided in advance.
+- **Who fills a freed slot:** the server that just answered pulls the next
+  batch itself, so the API that finished receiving is immediately asked for
+  the next queue item instead of sitting idle while batches wait. When
+  several servers are free at once (a run's cold start, or a short queue),
+  the pick **rotates over the servers** rather than always taking the
+  roomiest one — under the old roomiest-first rule a short queue (a small
+  page, a reveal-driven run) was swallowed whole by the roomier server and
+  the low-concurrency one never got a batch at all. The roomier server still
+  takes more overall because it answers more often, which is its correct
+  share.
 - Because of that, each API's **concurrency is a real bound on this side** and is
   set independently — a strong box at 4 next to a small one at 1 takes roughly
   four times the batches *and finishes its own share at its own speed*. The

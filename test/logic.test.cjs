@@ -451,6 +451,91 @@ async function main() {
     disp.drop('test over');
   }
 
+  // pickRoundRobin shares a sequential tail between the ticked APIs by index,
+  // so the echo-retry round is not pinned to whichever server pickRoomiest()
+  // happens to favour (with every server idle after the main run, that choice
+  // never changes and one API grinds the whole tail alone while the other waits).
+  {
+    const disp = ns.Dispatcher([{ name: 'a', concurrency: 1 }, { name: 'b', concurrency: 1 }],
+      () => Promise.resolve());
+    const names = [0, 1, 2, 3].map((i) => disp.pickRoundRobin(i).name);
+    ok('the sequential tail alternates between the two APIs',
+      names.join(',') === 'a,b,a,b', names.join(','));
+    const single = ns.Dispatcher([{ name: 'only', concurrency: 2 }], () => Promise.resolve());
+    ok('a single-API pool round-robins to that one server',
+      [0, 1, 2].map((i) => single.pickRoundRobin(i).name).join(',') === 'only,only,only');
+    disp.drop('done'); single.drop('done');
+  }
+
+  // The main run must stay work-conserving: every free slot is filled in the
+  // same pump pass, so neither server idles while batches wait. A slow server
+  // and a fast one, one slot each: the fast one finishes and re-takes, the
+  // slow one keeps its own slot busy, and the whole job is covered.
+  {
+    const served = { slow: 0, fast: 0 };
+    const disp = ns.Dispatcher(
+      [{ name: 'slow', concurrency: 1 }, { name: 'fast', concurrency: 1 }],
+      (item, api) => {
+        served[api.name]++;
+        return new Promise((res) => setTimeout(res, api.name === 'slow' ? 25 : 3));
+      });
+    await disp.runAll(Array.from({ length: 12 }, (_, i) => i));
+    ok('both servers worked: the idle one was never left waiting for work',
+      served.slow >= 1 && served.fast >= 1 && served.slow + served.fast === 12,
+      JSON.stringify(served));
+  }
+
+  // A SHORT queue must not be swallowed whole by the roomier server. With evo
+  // at 1 and local at 4 and only three batches waiting (a small page, or a
+  // reveal-driven run), the old roomiest-first pick handed all three to local
+  // and left evo idle for the whole run - the reported "one API does nothing
+  // while the other works" symptom. Rotating over the servers gives evo its
+  // turn from the very first pump.
+  {
+    const served = { evo: 0, local: 0 };
+    const disp = ns.Dispatcher(
+      [{ name: 'evo', concurrency: 1 }, { name: 'local', concurrency: 4 }],
+      (item, api) => {
+        served[api.name]++;
+        return new Promise((res) => setTimeout(res, 2));
+      });
+    await disp.runAll([1, 2, 3]);
+    ok('a short queue is shared: the low-concurrency server gets its turn',
+      served.evo === 1 && served.local === 2, JSON.stringify(served));
+  }
+
+  // The finisher-pull rule, told apart from roomiest-first: when a server
+  // answers and the queue is shorter than the roomier server's free slots,
+  // the answering server must take the waiting batch itself rather than be
+  // passed over for the server with more room. This is the case where the old
+  // roomiest-first rule left a slow server idle with a free slot while work
+  // still waited - the symptom reported from real two-API runs.
+  {
+    const taken = [];
+    const deferred = [];
+    const disp = ns.Dispatcher(
+      [{ name: 'slow', concurrency: 1 }, { name: 'fast', concurrency: 4 }],
+      (item, api) => {
+        taken.push([item, api.name]);
+        return new Promise((res) => deferred.push(() => res(item)));
+      });
+    disp.runAll([1, 2, 3, 4, 5, 6]);
+    const st0 = disp.stats();
+    ok('the cold pump fills every free slot and leaves one waiting',
+      st0.waiting === 1 && st0.inflight === 5, JSON.stringify(st0));
+    // Release the slow server's only request. It has one free slot; the fast
+    // server has four. The slow one must be the one that takes the last batch.
+    const slowIdx = taken.findIndex((t) => t[1] === 'slow');
+    deferred[slowIdx]();
+    await new Promise((r) => setTimeout(r, 5));
+    const st1 = disp.stats();
+    const slowTook = taken.filter((t) => t[1] === 'slow').length;
+    ok('the server that just answered takes the next batch, not the roomier one',
+      slowTook === 2 && st1.waiting === 0, JSON.stringify({ taken, st1 }));
+    deferred.forEach((d) => d());
+    await new Promise((r) => setTimeout(r, 5));
+  }
+
   console.log('== profiles (base url + endpoint) ==');
   const evo = ns.profiles.getProfile('evo-x2-plamo2');
   const local = ns.profiles.getProfile('local-plamo2');
