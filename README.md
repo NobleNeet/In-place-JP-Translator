@@ -38,8 +38,9 @@ plamo-page-translator/
 │   └── openai-client.js     # OpenAI-compatible client (swap-able later)
 ├── translation/
 │   ├── queue.js             # ordered queue
+│   ├── dispatch.js          # one batch queue + one slot-pool per ticked API (who gets the next batch)
 │   ├── batcher.js           # packs DOM blocks into API requests (count/slot + token caps)
-│   ├── scheduler.js         # concurrency semaphore (one per API profile)
+│   ├── scheduler.js         # concurrency semaphore (one per API profile; backstop behind dispatch.js)
 │   ├── cache.js             # session in-memory cache
 │   └── persistent.js        # exact-match cache in chrome.storage.local (survives the page)
 ├── shared/
@@ -116,24 +117,40 @@ The popup lists every profile as a row with a tick box and its own concurrency
 select. Tick several and one "Translate Page" run sends its batches through
 **all of the ticked servers in parallel**:
 
-- Each API has **its own request limiter** in the worker (`background/background.js`
-  keeps one semaphore per profile), so its concurrency is set independently —
-  a strong box at 4 next to a small one at 1 works as expected.
-- Batches are distributed by a **weighted round-robin** (`apiPlan()` in
-  `shared/settings.js`): an API appears in the schedule once per concurrency
-  slot it can fill, so its share of the requests matches its share of the
-  in-flight load (evo at 2 + local at 4 → two thirds of the batches go to
-  local). The send **order** never changes (article body first), only the
-  server a batch lands on.
+- The run keeps **one queue of batches and one slot-pool per ticked API** on the
+  page (`translation/dispatch.js`). A batch is addressed to a server **only at
+  the moment that server has a slot free**, so a server answers slowly and it
+  simply ends up with fewer batches; the work that has not started belongs to no
+  server, and an idle one is never left waiting for a job somebody else dealt
+  itself out. Nothing is decided in advance.
+- Because of that, each API's **concurrency is a real bound on this side** and is
+  set independently — a strong box at 4 next to a small one at 1 takes roughly
+  four times the batches *and finishes its own share at its own speed*. The
+  worker keeps its own per-profile semaphore (`background/background.js`) as a
+  backstop, not as the place where a run queues up.
+- The send **order** never changes (article body first, then headings, then page
+  chrome); only the server a batch lands on is decided late.
 - Saved under `apis` in `chrome.storage.local`, keyed by profile name:
   `{ "evo-x2-plamo2": { "enabled": true, "concurrency": 2 }, ... }`. No
   entries (every install saved before this existed) keeps the old
   single-profile behaviour: `profileName` alone, at `maxConcurrent`.
-- What a run would use: `__plamo.getApiPlan()` on the page; per-server limiter
-  numbers: `__PLAMO__.background.snapshot().apis` in the worker.
+- Live per-server numbers while a run goes on (`limit` / `active` / `free` /
+  `dispatched`, plus `waiting`, `inflight`, `dropped`): `__plamo.getState().dispatch`
+  on the page; the same pool after the run in the summary and in
+  `__plamo.getApiPlan().dispatch`. `__plamo.getApiPlan().schedule` is only the
+  share each server *tends* to get (one entry per slot it can fill) — it is a
+  diagnostic, **not** an assignment. Worker-side limiter numbers:
+  `__PLAMO__.background.snapshot().apis`.
+- **Stop** takes every batch that has not been handed to a server out of the
+  queue, so it is not sent later; the requests already in flight are aborted as
+  before.
 
-There is **no failover between servers yet**: if one ticked API is down, only
-its share of the batches fails — the others keep translating.
+There is still **no failover between servers**: a batch whose request died is
+re-sent to **the same server** it was sent to (`recoverBatch` in
+`content/content.js` splits it into small requests), because a server that
+answered 500 is not helped by another server that never saw the text. What an
+unreachable server no longer costs you is the *rest* of the page: batches it
+never started go out through the servers that have room.
 
 Settings you change in the popup (API servers and their concurrency, mode,
 segments per request, request packing) are persisted in `chrome.storage.local`.
@@ -228,6 +245,8 @@ window.__plamo.stopTranslation() // the Stop the widget's button offers mid-run
 window.__plamo.getSettings()   // current settings
 window.__plamo.getBatchPlan()  // how the next run would be packed: { segments, blocks, requests, segmentsPerRequest, caps, strategy, batches }
 window.__plamo.getBatcherCaps()// the caps the packer in use was built with (proves a saved setting landed)
+window.__plamo.getState().dispatch // mid-run: per server { name, limit, active, free, dispatched } + waiting/inflight/dropped
+window.__plamo.getApiPlan()    // ticked APIs + the share each tends to get (diagnostic, NOT an assignment)
 window.__plamo.getChannel()    // { kind: 'port'|'none', name, requests, pending } — is the run on the durable channel?
 window.__plamo.getRecoveryCaps()// { maxSegmentsPerRequest, maxRequests } used when a request dies in transport
 window.__plamo.getSegmentStats()// last scan: { nodes, visibleNodes, hiddenNodes, deferred, deferHidden, segments, blocks, roles, skipped }
@@ -243,8 +262,8 @@ window.__plamo.forgetDeferred()// drop the waiting list (a page that re-rendered
 No test framework and no dependencies; both suites run on plain Node:
 
 ```
-node test/logic.test.cjs   # queue, batcher/packer, scheduler, caches, batch request + line alignment, background, messaging
-node test/dom.test.cjs     # extractor + segmenter + renderer + packer + reveal watch + echo retry + persistent cache on a small fake DOM
+node test/logic.test.cjs   # queue, batcher/packer, scheduler, dispatcher, caches, batch request + line alignment, background, messaging
+node test/dom.test.cjs     # extractor + segmenter + renderer + packer + reveal watch + echo retry + persistent cache + two servers staying independent, on a small fake DOM
 ```
 
 `test/dom.test.cjs` builds a page containing the structures that used to break
@@ -275,10 +294,10 @@ All of these are in the popup and apply to the **next** "Translate Page" press.
 
 - **API servers** — one row per profile (`api/profiles.js`): tick it to use
   that server, and set **its own** max concurrent requests (1 / 2 / 4 / 8).
-  Each ticked server gets a separate semaphore (`translation/scheduler.js`) in
-  the worker, and its share of the batches is proportional to its concurrency
-  (see *Using several APIs at the same time* above). With one server ticked
-  this behaves exactly like the old single "Max concurrent requests" setting.
+  That number is that server's own bound and nothing else: the two settings do
+  not have to match each other, and a 4 next to a 1 is a supported setup (see
+  *Using several APIs at the same time* above). With one server ticked this
+  behaves exactly like the old single "Max concurrent requests" setting.
 - **Segments per request** (default 24): how many text nodes one request
   carries. A batch is also capped by estimated tokens (900), so long prose
   produces smaller batches on its own. The **first** batch is deliberately
@@ -487,9 +506,10 @@ segment at all. The three things that can leave text behind:
 
 - [x] Manifest V3 (Vivaldi/Chromium, classic scripts, no build step)
 - [x] Manual "Translate Page" start from the popup
-- [x] Multiple API profiles at once: batches split over every ticked server by
-      weighted round-robin, each with its own concurrency limiter (single
-      profile still works, and is the default)
+- [x] Multiple API profiles at once: one batch queue on the page, taken by
+      whichever ticked server has a slot free, each bounded by its **own**
+      concurrency (`translation/dispatch.js`) — a slow server never parks the
+      other one's share (single profile still works, and is the default)
 - [x] OpenAI-compatible `/v1/chat/completions` client (separated layer)
 - [x] Readable-block DOM extraction with proper exclusions
 - [x] Segment with unique id + stable DOM reference
@@ -524,9 +544,10 @@ segment at all. The three things that can leave text behind:
 ## Not yet implemented (later phases)
 
 - [ ] `fallback` / `balanced` connection modes (structure only)
-- [ ] Failover between API profiles: a server that is down should have its
-      batches re-sent through the other ticked server, instead of only failing
-      its own share
+- [ ] Failover between API profiles: a request that died should be re-sent
+      through another ticked server instead of only being split and re-sent to
+      the one that failed it (unstarted batches already go wherever there is
+      room)
 - [ ] `IntersectionObserver` viewport streaming — the bands are measured with
       `getBoundingClientRect()` at scan time (on screen / within 400 px / rest), so
       a node that scrolls into view while a run is going keeps the band it had

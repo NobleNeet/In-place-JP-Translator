@@ -18,7 +18,8 @@ const order = [
   'shared/logger.js','shared/constants.js','shared/messaging.js','shared/settings.js',
   'api/profiles.js','api/openai-client.js','translation/scheduler.js','translation/cache.js',
   'translation/persistent.js',
-  'translation/batcher.js','translation/queue.js','content/extractor.js','content/priority.js',
+  'translation/batcher.js','translation/queue.js','translation/dispatch.js',
+  'content/extractor.js','content/priority.js',
   'content/segmenter.js','content/renderer.js','background/background.js',
   'content/content.js','popup/popup.js'
 ];
@@ -289,6 +290,25 @@ async function main() {
   const tunedObserved = await runWithLimit(semTuned, 12);
   ok('raised limit enforced', tunedObserved <= 4 && tunedObserved >= 2);
 
+  // A limiter that loses a slot reads exactly like a server that went busy and
+  // never picked up the next request, so every way a task can end has to give
+  // its slot back.
+  console.log('== a semaphore slot always comes back ==');
+  {
+    const sem = new ns.Semaphore(1);
+    const boomed = sem.run(() => { throw new Error('sync boom'); }).catch((e) => e.message);
+    const afterBoom = sem.run(() => 'second');
+    const afterRejecting = sem.run(() => Promise.reject(new Error('nope'))).catch((e) => e.message);
+    const afterPlain = sem.run(() => 7);
+    ok('a task that throws synchronously frees its slot and its caller still gets its turn',
+      (await boomed) === 'sync boom' && (await afterBoom) === 'second');
+    ok('a rejected task frees its slot', (await afterRejecting) === 'nope');
+    ok('a task returning something with no then() frees its slot', (await afterPlain) === 7);
+    ok('nothing is stuck in the limiter afterwards',
+      sem.getActive() === 0 && sem.getPending() === 0 && (await sem.run(() => 'third')) === 'third',
+      { active: sem.getActive(), pending: sem.getPending() });
+  }
+
   console.log('== settings ==');
   await chromeFake.storage.local.set({ plamo: { profileName: 'local-plamo2', maxConcurrent: 3, batch: { maxSegmentsPerBatch: 8 } } });
   const s = await ns.settings.loadSettings();
@@ -329,6 +349,107 @@ async function main() {
     (() => { const o = ns.settings.activeApis({ profileName: 'local-plamo2', maxConcurrent: 2,
       apis: { 'evo-x2-plamo2': { enabled: false } } });
       return o.length === 1 && o[0].name === 'local-plamo2' && o[0].concurrency === 2; })());
+
+  console.log('== the run dispatches itself over the servers (translation/dispatch.js) ==');
+  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  // A slow server and a fast one, one slot each. Nothing is dealt out in advance,
+  // so the slow one must not park eight batches behind its own answer.
+  {
+    const slowMs = 40, fastMs = 5;
+    const live = { slow: 0, fast: 0 }, max = { slow: 0, fast: 0 }, served = [];
+    const disp = ns.Dispatcher(
+      [{ name: 'slow', concurrency: 1 }, { name: 'fast', concurrency: 1 }],
+      (item, api) => {
+        const k = api.name;
+        live[k]++; if (live[k] > max[k]) max[k] = live[k];
+        served.push(k);
+        return new Promise((res) => setTimeout(() => { live[k]--; res(item); }, k === 'slow' ? slowMs : fastMs));
+      });
+    const items = Array.from({ length: 8 }, (_, i) => i);
+    await disp.runAll(items);
+    const st = disp.stats();
+    ok('every batch went exactly once',
+      served.length === 8 && new Set(served).size === 2, JSON.stringify(st));
+    ok('a server never holds more than its own concurrency',
+      max.slow === 1 && max.fast === 1, JSON.stringify(max));
+    ok('a slow server does not stop the queue: the idle one took the work',
+      served.filter((k) => k === 'fast').length >= 5, JSON.stringify(served));
+    ok('nothing is left waiting or in flight once the run is over',
+      st.waiting === 0 && st.inflight === 0 && st.dropped === 0, JSON.stringify(st));
+    ok('the pool reports each server separately',
+      st.servers.length === 2 && st.servers[0].name === 'slow' && st.servers[0].limit === 1 &&
+      st.servers[1].name === 'fast' &&
+      st.servers[0].dispatched + st.servers[1].dispatched === 8, JSON.stringify(st.servers));
+  }
+
+  // Asymmetric pair: the limits are honoured individually, and the page still
+  // finishes (the old schedule-by-index could not say either of those).
+  {
+    const live = { slow: 0, fast: 0 }, max = { slow: 0, fast: 0 };
+    let done = 0;
+    const disp = ns.Dispatcher(
+      [{ name: 'slow', concurrency: 2 }, { name: 'fast', concurrency: 1 }],
+      (item, api) => {
+        const k = api.name;
+        live[k]++; if (live[k] > max[k]) max[k] = live[k];
+        return new Promise((res) => setTimeout(() => { live[k]--; done++; res(item); }, k === 'slow' ? 30 : 4));
+      });
+    await disp.runAll(Array.from({ length: 12 }, (_, i) => i));
+    ok('2 and 1: each server filled its own slots and never a spare one',
+      max.slow === 2 && max.fast === 1, JSON.stringify(max));
+    ok('an asymmetric pair covers the whole job', done === 12, String(done));
+  }
+
+  // A server that never answers holds exactly its own slots and nothing else.
+  {
+    const served = [];
+    let fastDone = 0;
+    const disp = ns.Dispatcher(
+      [{ name: 'fast', concurrency: 1 }, { name: 'stuck', concurrency: 1 }],
+      (item, api) => {
+        served.push(api.name);
+        if (api.name !== 'stuck') return new Promise((res) => setTimeout(() => { fastDone++; res(item); }, 2));
+        return new Promise(() => {}); // never settles
+      });
+    const never = disp.runAll(Array.from({ length: 9 }, (_, i) => i));
+    ok('the run is not held up by a server that cannot answer', never instanceof Promise);
+    await wait(60);
+    const st = disp.stats();
+    ok('the idle server worked through the whole queue while the other sat busy',
+      fastDone === 8 && served.filter((k) => k === 'fast').length === 8 &&
+      served.filter((k) => k === 'stuck').length === 1, JSON.stringify(served));
+    ok('only the unanswered request is left in flight; nothing waits behind it',
+      st.inflight === 1 && st.waiting === 0, JSON.stringify(st));
+  }
+
+  // Stop: everything not yet sent is released and never sent.
+  {
+    let sent = 0;
+    const disp = ns.Dispatcher([{ name: 'a', concurrency: 1 }],
+      (item) => { sent++; return Promise.resolve(item); });
+    const p = disp.runAll([1, 2, 3, 4, 5, 6]);
+    const droppedNow = disp.drop('stop requested');
+    await p;
+    const st = disp.stats();
+    ok('stop releases the queue and sends nothing more',
+      droppedNow === 5 && st.dropped === 5 && sent === 1 && st.waiting === 0 && st.inflight === 0,
+      JSON.stringify({ droppedNow, sent, st }));
+  }
+
+  // The echo-retry round picks a destination itself, sequentially.
+  {
+    const disp = ns.Dispatcher([{ name: 'tight', concurrency: 1 }, { name: 'roomy', concurrency: 3 }],
+      () => new Promise(() => {}));
+    ok('the roomiest server is named for work that must go one at a time',
+      disp.pickRoomiest().name === 'roomy');
+    disp.submit('a'); disp.submit('b'); disp.submit('c'); // fills roomy(3->1) then tight(1->0)
+    const st = disp.stats();
+    ok('and it is named from the live slot counts, not the settings alone',
+      st.servers[0].active === 1 && st.servers[1].active === 2 &&
+      disp.pickRoomiest().name === 'roomy', JSON.stringify(st.servers));
+    disp.drop('test over');
+  }
 
   console.log('== profiles (base url + endpoint) ==');
   const evo = ns.profiles.getProfile('evo-x2-plamo2');

@@ -85,9 +85,11 @@
 
   // One row per API profile (api/profiles.js): a tick box for "use this
   // server" and its own concurrency select. Tick several and a run sends its
-  // batches through all of them at once — each server's requests are bounded by
-  // its own limiter in background/background.js, and its share of the batches
-  // is proportional to that concurrency (shared/settings.js apiPlan()).
+  // batches through all of them at once: the batches wait in one queue on the
+  // page and a server takes the next one when it has a free slot, so the
+  // concurrency set here is that server's own bound (translation/dispatch.js).
+  // A busy server ends up with fewer batches; it never holds the others' work
+  // hostage, and the two settings do not have to match each other.
   function populateApis() {
     var host = $('apis');
     if (!host) return;

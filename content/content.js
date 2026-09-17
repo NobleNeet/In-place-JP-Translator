@@ -10,8 +10,9 @@
 // band, and inside a band by how far down the page the text is -> pack the
 // segments into batches, where one batch is ONE API
 // request (paragraph fragments stay together, menu/list items are piled into
-// the same request) -> send each batch to the background (in parallel,
-// concurrency bound = requests in flight) -> write each finished translation
+// the same request) -> hand each batch to the background as a server frees a
+// slot (translation/dispatch.js: every ticked API takes the next batch when it
+// has room, bounded by its OWN concurrency) -> write each finished translation
 // into its own text node (node.nodeValue only) as soon as its batch arrives.
 // Because an element's children are never replaced, links/forms/images survive
 // and the layout holds. A translation that is just a copy of the English
@@ -50,6 +51,7 @@
   var restoreNode = ns.renderer.restore;
   var restoreNodes = ns.renderer.restoreAll;
   var createBatcher = ns.createBatcher;
+  var Dispatcher = ns.Dispatcher;
   var SessionCache = ns.SessionCache;
   var loadSettings = ns.settings.loadSettings;
   var activeApis = ns.settings.activeApis;
@@ -111,6 +113,10 @@
   var runSeq = 0;
   var lastRun = null;
   var live = null; // counters of the run in progress (see __plamo.getState())
+  // The server pool of the run in progress, so Stop can take back the batches it
+  // has not handed to a server yet and getState() can say what each server is
+  // doing right now. Null between runs.
+  var activeDispatcher = null;
 
   // chrome.runtime.lastError strings are cryptic; attach the fix that applies.
   function hintFor(message) { return messaging.hintFor(message); }
@@ -313,6 +319,9 @@
     live.skipped = stats.skipped;
     live.errorCounts = stats.errorCounts;
     live.skipCounts = stats.skipCounts;
+    // Per-server numbers of the run in flight: which API is busy, which one is
+    // idle, and how much of the run is still unassigned.
+    if (activeDispatcher) live.dispatch = activeDispatcher.stats();
     uiEvent('progress'); // the widget reads getState() itself; this only says "look again"
   }
 
@@ -536,7 +545,7 @@
   // right for a translation model and wrong for a model that just echoed).
   // Still identical after this, it is recorded as a fact: no third round, and
   // nothing is cached either way (the cache only ever holds landed text).
-  function retryEchoSegments(tag, apiSchedule, segmentsById, stats, latencies) {
+  function retryEchoSegments(tag, dispatcher, segmentsById, stats, latencies) {
     var echoes = stats.echoSegments;
     if (!echoes.length) return Promise.resolve();
     stats.retryRound = true; // set NOW: an answer arriving during this round must not re-enter the queue
@@ -563,7 +572,11 @@
     chunks.forEach(function (chunkBatch, ci) {
       chain = chain.then(function () {
         if (abortRequested) return;
-        var api = apiSchedule[ci % apiSchedule.length];
+        // This round is deliberately one request at a time, but which server gets
+        // one is still decided now rather than back at packing time: after a run,
+        // one of the two is usually much emptier than the other.
+        var api = (dispatcher && dispatcher.pickRoomiest()) ||
+          { name: settings.profileName, concurrency: settings.maxConcurrent };
         var btag = tag + ' echo#' + (ci + 1);
         var payload = {
           id: messaging.makeRequestId('r' + runSeq + 'echo' + (ci + 1)),
@@ -617,12 +630,14 @@
       // The saved caps have to reach the packer, which was built before settings
       // were loaded (see applyBatchSettings).
       applyBatchSettings();
-      // Which APIs this run sends through. Every ticked server gets a share of
-      // the batches weighted by its own concurrency (shared/settings.js
-      // apiPlan); the send ORDER stays priority-first, only the destination of
-      // each batch alternates. One API reproduces the old single-server run.
-      var apiSchedule = apiPlan(settings);
-      live.apis = activeApis(settings);
+      // Which APIs this run sends through, each with its own concurrency. The
+      // batches are NOT dealt out over them in advance: they wait in one queue in
+      // priority order and a server takes the next one when it has a slot free
+      // (translation/dispatch.js). The send ORDER is unchanged; only the server a
+      // batch lands on is decided late, which is what keeps two servers from
+      // sharing one queue. One API reproduces the old single-server run.
+      var apiServers = activeApis(settings);
+      live.apis = apiServers;
       live.apiSplit = {};
       // What this run sends, and what the scan held back because the user could
       // not see it. The held-back nodes are not wasted: the reveal watch below
@@ -719,50 +734,71 @@
         openChannel(tag);
         live.channel = channel ? 'port' : 'sendMessage';
 
-        var promises = batches.map(function (batch, batchIndex) {
-          var btag = tag + ' batch#' + (batchIndex + 1);
-          // This batch's destination: the weighted round-robin over every ticked
-          // API. Its own concurrency rides along so the worker bounds THAT
-          // server's queue, not a global one.
-          var api = apiSchedule[batchIndex % apiSchedule.length];
-          live.apiSplit[api.name] = (live.apiSplit[api.name] || 0) + 1;
+        // One queue plus one slot-pool per ticked API (translation/dispatch.js):
+        // a batch is addressed to a server only when THAT server has a slot free.
+        // Dealing the batches out in advance is what made the two servers share
+        // one fate - everything dealt to the slow one waited behind it while the
+        // server that was done sat idle and was never offered the rest. The
+        // worker's per-profile semaphore stays the backstop it was meant to be.
+        function sendBatch(job, server) {
+          live.apiSplit[server.name] = (live.apiSplit[server.name] || 0) + 1;
           // Only wire-safe fields cross the boundary; the cache travels as a plain
           // object limited to this batch (a Map would arrive as "{}").
           var payload = {
-            id: messaging.makeRequestId('r' + runId + 'b' + (batchIndex + 1)),
+            id: job.id,
             type: MSG_TRANSLATE,
-            batch: messaging.toWireBatch(batch),
-            profileName: api.name,
-            concurrency: api.concurrency,
+            batch: messaging.toWireBatch(job.batch),
+            profileName: server.name,
+            // The server's own limit rides along so the worker bounds THAT
+            // server's queue too: the per-segment retries a batch adds inside the
+            // worker are its own doing, and this side cannot count them.
+            concurrency: server.concurrency,
             // No timeoutMs: a batched request answers many segments at once, so the
             // background scales the timeout with the size of the batch.
             strategy: (settings.request && settings.request.strategy) || undefined,
             request: settings.request || undefined,
-            cache: messaging.toWireCache(cache, batch.segments)
+            cache: messaging.toWireCache(cache, job.batch.segments)
           };
           live.sent++;
           live.inFlight++;
           return sendTranslate(payload).then(function (res) {
             live.inFlight--;
-            handleBatchResponse(btag, batchIndex + 1, batch, res, segmentsById, stats, latencies);
+            handleBatchResponse(job.tag, job.number, job.batch, res, segmentsById, stats, latencies);
           }, function (err) {
             live.inFlight--;
             var message = lastErrorMessage(err);
             countError(stats, 'transport');
             pushError(stats, message);
-            log.error(btag + ' TRANSPORT FAILURE for ' + batch.segments.length + ' segment(s): ' + message +
-              hintFor(message) + ' :: ' + messaging.summarizeBatch(batch));
+            log.error(job.tag + ' TRANSPORT FAILURE for ' + job.batch.segments.length + ' segment(s): ' + message +
+              hintFor(message) + ' :: ' + messaging.summarizeBatch(job.batch));
             // Nothing was written, so nothing is lost yet: give the segments a
             // second chance in requests small enough to answer.
-            return recoverBatch(btag, batchIndex + 1, batch, segmentsById, stats, latencies, api);
+            return recoverBatch(job.tag, job.number, job.batch, segmentsById, stats, latencies, server);
           });
-        });
+        }
 
-        return Promise.all(promises).then(function () {
+        var dispatcher = new Dispatcher(apiServers, sendBatch);
+        activeDispatcher = dispatcher;
+        live.dispatch = dispatcher.stats();
+        var allBatches = dispatcher.runAll(batches.map(function (batch, batchIndex) {
+          return {
+            batch: batch,
+            number: batchIndex + 1,
+            tag: tag + ' batch#' + (batchIndex + 1),
+            id: messaging.makeRequestId('r' + runId + 'b' + (batchIndex + 1))
+          };
+        }));
+        log.debug(tag + ' dispatched over ' + apiServers.length + ' API(s) ' +
+          dispatcher.stats().servers.map(function (s) { return s.name + '\u00d7' + s.limit; }).join('+') +
+          ' queued=' + dispatcher.stats().waiting);
+
+        return allBatches.then(function () {
           // Batches are all answered; identical answers get their one retry here,
           // still inside the run so the summary below reports the real outcome.
-          return retryEchoSegments(tag, apiSchedule, segmentsById, stats, latencies);
+          return retryEchoSegments(tag, dispatcher, segmentsById, stats, latencies);
         }).then(function () {
+          live.dispatch = dispatcher.stats(); // the split as the run left it
+          activeDispatcher = null;
           closeChannel('run#' + runId + ' finished');
           // Everything this run landed goes to the cache that outlives the page
           // in ONE write (translation/persistent.js queued it as it landed).
@@ -782,8 +818,11 @@
               // (persistentHits) and stored for the next page view (persisted).
               persisted: flushRes.written,
               persistentHits: persistentHits,
-              // How the run split its batches over the APIs it used.
+              // How the run split its batches over the APIs it used, and what the
+              // server pool looked like when it finished (batches per server,
+              // slots, anything Stop dropped).
               apiSplit: live ? Object.assign({}, live.apiSplit) : null,
+              dispatch: live ? live.dispatch : null,
               elapsedMs: Math.round(performance.now() - t0),
               firstTranslatedLatencyMs: latencies.firstTranslatedLatencyMs,
               firstViewportLatencyMs: latencies.firstViewportLatencyMs,
@@ -846,6 +885,10 @@
   function stopRun() {
     abortRequested = true;
     setStatus('idle');
+    // Everything the run had not handed to a server yet is taken back out of its
+    // queue: a Stop that only stopped sending the next batch would still have
+    // that batch (and the ones behind it) go out minutes later.
+    if (activeDispatcher) activeDispatcher.drop('stop requested');
     // A reveal of its own starts a NEW run, so a Stop that only paused the
     // batches in flight would still end up sending requests minutes later.
     // The waiting list is kept: the next run holds those nodes back again and
@@ -941,10 +984,12 @@
       // How the last/current run talks to the worker: 'port' is the durable
       // channel, 'sendMessage' means connect() was unavailable to this page.
       channel: l.channel || (channel ? 'port' : 'sendMessage'),
-      // The APIs this run sends (or sent) through, and how the batches split
-      // over them (see __plamo.getApiPlan()).
+      // The APIs this run sends (or sent) through, how its batches split over
+      // them, and (while it runs) each server's live slots: limit/active/free
+      // plus the batches still queued for nobody in particular.
       apis: l.apis || null,
       apiSplit: l.apiSplit || null,
+      dispatch: (activeDispatcher && activeDispatcher.stats()) || l.dispatch || null,
       abortRequested: abortRequested,
       cache: { entries: cache.map.size, hits: cache.hits, misses: cache.misses },
       profile: settings.profileName || null,
@@ -1350,9 +1395,17 @@
         : { kind: 'none', name: C.PORT_TRANSLATE, requests: 0, pending: [] };
     },
     getRecoveryCaps: function () { return Object.assign({}, C.RECOVERY); },
-    // The APIs a run would send through right now (settings.apis), and the
-    // weighted round-robin schedule that decides which batch gets which server.
-    getApiPlan: function () { return { active: activeApis(settings), schedule: apiPlan(settings) }; },
+    // The APIs a run would send through right now (settings.apis). `schedule` is
+    // the share each server tends to get (one entry per slot it can fill), NOT an
+    // assignment: which server a batch lands on is decided when a slot frees, in
+    // translation/dispatch.js. `dispatch` is that pool while a run is going.
+    getApiPlan: function () {
+      return {
+        active: activeApis(settings),
+        schedule: apiPlan(settings),
+        dispatch: activeDispatcher ? activeDispatcher.stats() : (live && live.dispatch) || null
+      };
+    },
     // One row per text node whose nodeValue we replaced: { path, before, after }.
     getApplied: function (limit) { return renderer.appliedSample(limit); },
     scanStats: function () { return ns.extractor.scanStats(); },
@@ -1410,7 +1463,15 @@
   };
 
   var prio0 = prioritySettings();
-  log.info('content script ready v' + manifestVersion +
+// The run's server pool (one slot per API concurrency, batches handed over as a
+// slot frees) comes from translation/dispatch.js. Without it there is no
+// per-server bound on this side at all, so say it out loud once rather than
+// have every batch go out at once and pile up in the worker's queue.
+if (typeof Dispatcher !== 'function') {
+  log.error('translation/dispatch.js is not loaded before content.js: a run cannot bound each API on the page side and will abort (check content_scripts in manifest.json)');
+}
+
+log.info('content script ready v' + manifestVersion +
     ' (send order ' + ((C.PRIORITY_ROLES || []).join(' > ') || 'viewport only') +
     ' then top-down=' + prio0.topDown + ', deferHidden=' + prio0.deferHidden +
     ', re-check hidden text ' + prio0.revealDebounceMs +

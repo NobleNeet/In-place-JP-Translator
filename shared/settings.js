@@ -136,12 +136,14 @@
     return out;
   }
 
-  // Which API one batch goes to: round-robin over a schedule where each API
-  // appears once per concurrency slot it can fill, so its share of the
-  // requests matches its share of the in-flight load (evo at 2 + local at 4
-  // hands two thirds of the batches to local). One API alone reproduces the
-  // old behaviour exactly; the send ORDER of batches never changes, only
-  // their destination does.
+  // What a run is likely to look like, NOT what a run does: one entry per
+  // concurrency slot each ticked API can fill, so a roomier server shows up
+  // more often (evo at 2 + local at 4 tends to hand two thirds of the batches
+  // to local). Nothing is assigned from this list — destinations are picked as
+  // slots free up, in translation/dispatch.js — and the numbers are only what
+  // `__plamo.getApiPlan().schedule` reports for tuning. Kept off the send path
+  // on purpose: dealing the batches out in advance is what made two servers
+  // behave as one queue.
   function apiPlan(settings) {
     var plan = [];
     activeApis(settings).forEach(function (api) {

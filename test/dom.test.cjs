@@ -682,6 +682,13 @@ const stored = {};
 // at the end turns it on again through putSettings.
 stored.plamo = { cache: { enabled: false } };
 const bg = { requests: 0, sent: [] }; // the fake worker: what it was asked to translate
+// Per-server instrumentation for the multi-API run below: bg.latency answers a
+// request from a given profile after N ms, and the counters say what each server
+// was asked and how many requests it had in flight at once.
+bg.latency = null;
+bg.byProfile = {};
+bg.inflight = {};
+bg.maxInflight = {};
 function answerTranslate(msg, respond) {
   const wire = (msg && msg.batch && msg.batch.segments) || [];
   // Like the real worker, a text the page already carries (msg.cache) is
@@ -709,11 +716,19 @@ function answerTranslate(msg, respond) {
     // English?" rule refuses to collect it a second time.
     results[s.id] = { text: s.text, translatedText: out };
   });
-  setTimeout(() => respond({
-    requestId: msg.id, status: 'success', results, translated: wire.length - cachedAnswers, failed: 0,
-    cacheHits: cachedAnswers, requests: 1, segments: wire.length, units: (msg.batch && msg.batch.units) || 1,
-    elapsedMs: 1, profile: 'fake', endpoint: 'http://127.0.0.1:9/v1', strategy: 'multi'
-  }), 0);
+  const prof = (msg && msg.profileName) || 'unnamed';
+  bg.byProfile[prof] = (bg.byProfile[prof] || 0) + wire.length;
+  bg.inflight[prof] = (bg.inflight[prof] || 0) + 1;
+  bg.maxInflight[prof] = Math.max(bg.maxInflight[prof] || 0, bg.inflight[prof]);
+  const ms = (bg.latency && bg.latency[prof]) || 0;
+  setTimeout(() => {
+    if (bg.inflight[prof] > 0) bg.inflight[prof]--;
+    respond({
+      requestId: msg.id, status: 'success', results, translated: wire.length - cachedAnswers, failed: 0,
+      cacheHits: cachedAnswers, requests: 1, segments: wire.length, units: (msg.batch && msg.batch.units) || 1,
+      elapsedMs: 1, profile: prof, endpoint: 'http://127.0.0.1:9/v1', strategy: 'multi'
+    });
+  }, ms);
 }
 sandbox.chrome = {
   runtime: {
@@ -752,7 +767,8 @@ sandbox.setTimeout = setTimeout;
 sandbox.clearTimeout = clearTimeout;
 sandbox.clearInterval = clearInterval;
 const contentOrder = ['shared/messaging.js', 'shared/settings.js', 'api/profiles.js',
-  'api/openai-client.js', 'translation/cache.js', 'translation/persistent.js', 'content/content.js'];
+  'api/openai-client.js', 'translation/cache.js', 'translation/persistent.js',
+  'translation/dispatch.js', 'content/content.js'];
 for (const f of contentOrder) vm.runInContext(readFileSync(path.join(dir, f), 'utf8'), ctx, { filename: f });
 
 const api = sandbox.window.__plamo;
@@ -1018,6 +1034,74 @@ const putSettings = (patch) => sandbox.chrome.storage.local.set(patch);
   const pcCleared = await api.clearPersistentCache();
   ok('__plamo.clearPersistentCache() empties the store',
     pcCleared.removed === 2 && pcKeys().length === 0, pcCleared);
+
+  // --- two API servers, one queue ---------------------------------------------
+  // The shape that used to make two servers behave like one queue: a batch's
+  // server was picked up front (a weighted round-robin over the two
+  // concurrencies) and every batch went out at once, so anything dealt to the
+  // slow server waited behind it for the whole run while the server that had
+  // finished its share sat idle and was never offered the rest. Now a batch is
+  // addressed to a server only when THAT server has a slot free
+  // (translation/dispatch.js): the idle one takes the work, each server stays
+  // inside its own concurrency, and the page gets covered either way.
+  console.log('== two API servers keep their independence (translation/dispatch.js) ==');
+  await putSettings({ plamo: {
+    priority: { deferHidden: true }, cache: { enabled: false }, maxConcurrent: 1,
+    // One request at a time per server, one segment per request: this section
+    // wants one request per sentence, so six of them can be split over the two.
+    batch: { maxSegmentsPerBatch: 1, firstBatchMaxSegments: 1, maxShortSegmentsPerBatch: 1 },
+    apis: { 'evo-x2-plamo2': { enabled: true, concurrency: 1 }, 'local-plamo2': { enabled: true, concurrency: 1 } }
+  } });
+  const slowProf = 'evo-x2-plamo2';
+  const fastProf = 'local-plamo2';
+  const apiBox = E('div', { class: 'api-zone' });
+  for (let i = 0; i < 6; i++) apiBox.appendChild(E('p', {}, 'Independent server sentence ' + i));
+  mainEl.appendChild(apiBox);
+  const apiNodes = apiBox.querySelectorAll('p').map((p) => p.firstChild);
+  bg.latency = {}; bg.latency[slowProf] = 90; bg.latency[fastProf] = 1;
+  bg.byProfile = {}; bg.inflight = {}; bg.maxInflight = {};
+  const runTwo = await api.translatePage(apiBox);
+  const split = (bg.byProfile[slowProf] || 0) + ' slow / ' + (bg.byProfile[fastProf] || 0) + ' fast';
+  ok('both ticked servers translated this page',
+    Object.keys(bg.byProfile).length === 2, JSON.stringify(bg.byProfile));
+  ok('a slow server does not park its share: the idle one takes the work',
+    (bg.byProfile[fastProf] || 0) >= 4, split);
+  ok('the whole box came out translated although one server was busy the whole time',
+    runTwo.applied === 6 && apiNodes.every((n) => jp(n.nodeValue)),
+    [runTwo.applied, apiNodes.map((n) => n.nodeValue)]);
+  ok('each server stayed inside its own concurrency',
+    (bg.maxInflight[slowProf] || 0) <= 1 && (bg.maxInflight[fastProf] || 0) <= 1,
+    JSON.stringify(bg.maxInflight));
+  ok('the run reports how the batches split over the servers',
+    !!runTwo.dispatch && runTwo.dispatch.servers.length === 2 &&
+    runTwo.dispatch.servers.reduce((n, s) => n + s.dispatched, 0) === 6,
+    JSON.stringify(runTwo.dispatch));
+  const planTwo = api.getApiPlan();
+  ok('one API ticked at 1 and the other at 1 still lists both servers',
+    planTwo.active.length === 2 && planTwo.active.every((a) => a.concurrency === 1),
+    JSON.stringify(planTwo.active));
+
+  // Asymmetric limits: this is the setting combination that used to leave part of
+  // the page untranslated until both servers were given the same concurrency.
+  await putSettings({ plamo: {
+    priority: { deferHidden: true }, cache: { enabled: false }, maxConcurrent: 1,
+    batch: { maxSegmentsPerBatch: 1, firstBatchMaxSegments: 1, maxShortSegmentsPerBatch: 1 },
+    apis: { 'evo-x2-plamo2': { enabled: true, concurrency: 2 }, 'local-plamo2': { enabled: true, concurrency: 1 } }
+  } });
+  const apiBox2 = E('div', { class: 'api-zone2' });
+  for (let i = 0; i < 9; i++) apiBox2.appendChild(E('p', {}, 'Asymmetric pair sentence ' + i));
+  mainEl.appendChild(apiBox2);
+  const apiNodes2 = apiBox2.querySelectorAll('p').map((p) => p.firstChild);
+  bg.latency = {}; bg.latency[slowProf] = 120; bg.latency[fastProf] = 1;
+  bg.byProfile = {}; bg.inflight = {}; bg.maxInflight = {};
+  const runAsym = await api.translatePage(apiBox2);
+  ok('an asymmetric pair (2 and 1) still covers the whole page',
+    runAsym.applied === 9 && apiNodes2.every((n) => jp(n.nodeValue)),
+    [runAsym.applied, runAsym.total]);
+  ok('a server at 2 fills two slots and a server at 1 never a third',
+    (bg.maxInflight[slowProf] || 0) <= 2 && (bg.maxInflight[fastProf] || 0) <= 1,
+    JSON.stringify(bg.maxInflight));
+  bg.latency = null;
 
 })().then(finish, function (err) {
   fail++;

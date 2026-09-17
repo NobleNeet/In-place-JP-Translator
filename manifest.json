@@ -35,6 +35,7 @@
         "translation/cache.js",
         "translation/persistent.js",
         "translation/queue.js",
+        "translation/dispatch.js",
         "content/content.js",
         "content/ui.js"
       ]

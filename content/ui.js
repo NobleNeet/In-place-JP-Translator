@@ -55,6 +55,13 @@
   }
 
   // --- rendering ---------------------------------------------------------------
+  // 処理所要時間を人が読みやすい秒表示にする（9.4秒 / 1分23秒）。
+  function fmtSeconds(ms) {
+    var s = ms / 1000;
+    if (s < 60) return (s < 10 ? s.toFixed(1) : Math.round(s)) + '秒';
+    return Math.floor(s / 60) + '分' + (Math.round(s) % 60) + '秒';
+  }
+
   // The sub line is the "how far along is it?" answer: while running it tracks
   // the live counters, once done it reports what the last run achieved.
   function subText() {
@@ -73,6 +80,7 @@
       if (run.cacheHits) bits.push('cache ' + run.cacheHits);
       if (run.persistentHits) bits.push('恒久cache ' + run.persistentHits);
       if (run.failed) bits.push('失敗 ' + run.failed);
+      if (run.elapsedMs) bits.push(fmtSeconds(run.elapsedMs));
       return bits.join(' / ');
     }
     return '';

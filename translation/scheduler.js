@@ -11,15 +11,33 @@
     var active = 0;
     var queue = [];
 
+    // One queued task on its own, in its own function: the answer must settle the
+    // caller it belongs to and free the slot it started on, not whatever task the
+    // pump loop was holding when it came back.
+    function start(next) {
+      active++;
+      // A slot is only ever given back once. Calling fn() bare inside the pump
+      // loop meant a task that threw synchronously (or returned something with no
+      // `then`) took its slot with it: active never came back down, the rest of
+      // that pump pass never started, and the limiter lost capacity for good -
+      // which reads exactly like "that server went busy and never picked up the
+      // next request again".
+      var settled = false;
+      var finish = function () {
+        if (settled) return;
+        settled = true;
+        active--;
+        if (active < 0) active = 0;
+        pump();
+      };
+      var started;
+      try { started = next.fn(); } catch (err) { started = Promise.reject(err); }
+      Promise.resolve(started).then(function (v) { finish(); next.ok(v); },
+        function (e) { finish(); next.err(e); });
+    }
+
     function pump() {
-      while (active < maxSlots && queue.length) {
-        var next = queue.shift();
-        active++;
-        next.fn().then(next.ok, next.err).finally(function () {
-          active--;
-          pump();
-        });
-      }
+      while (active < maxSlots && queue.length) start(queue.shift());
     }
 
     function run(fn) {

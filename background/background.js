@@ -42,6 +42,15 @@ importScripts(
   // went through getProfile(), so these keys are always real profile names;
   // creating one per profile up front also means snapshot() lists every
   // server before its first request.
+  //
+  // Since translation/dispatch.js the page already sends a batch only when that
+  // server has a slot free, so in the normal case these semaphores never hold
+  // anything: they are the backstop for callers that do not know the settings
+  // (a second tab, another extension page, a recovery round that outlived a
+  // Stop). A run must not end up queueing here instead: when every batch of a
+  // run was posted at once and only these semaphores held the line, a slow
+  // server kept its whole share waiting in here while the idle one was never
+  // offered any of it.
   var semaphores = {};
   function semaphoreFor(name) {
     if (!semaphores[name]) semaphores[name] = new ns.Semaphore(C.DEFAULT_MAX_CONCURRENT);
