@@ -83,6 +83,16 @@
     return null;
   }
 
+  function isCatTranslateModel(model) {
+    return String(model == null ? '' : model).toLowerCase().indexOf('cat-translate-1.4b') !== -1;
+  }
+
+  function sanitizeModelOutput(text, model) {
+    var out = String(text == null ? '' : text);
+    // CAT-Translate can emit the EOS spelling as ordinary text via llama.cpp.
+    return isCatTranslateModel(model) ? out.split('</s>').join('') : out;
+  }
+
   // POSTs one text to the profile endpoint. Never throws: every failure comes
   // back as { error, errorType } so one bad segment cannot kill a batch.
   async function requestCompletion(profile, text, opts) {
@@ -139,6 +149,7 @@
       }
 
       var out = extractOutputText(parsed, kind);
+      if (out != null) out = sanitizeModelOutput(out, profile.model);
       if (out == null || out === '') {
         var finishReason = parsed && parsed.choices && parsed.choices[0] && parsed.choices[0].finish_reason;
         log.warn('empty_response ' + profile.name + ' ' + url + ' ' + elapsedMs + 'ms' +
@@ -317,6 +328,8 @@
     endpointKind: endpointKind,
     buildMessages: buildMessages,
     buildRequestBody: buildRequestBody,
-    extractOutputText: extractOutputText
+    extractOutputText: extractOutputText,
+    isCatTranslateModel: isCatTranslateModel,
+    sanitizeModelOutput: sanitizeModelOutput
   };
 })();

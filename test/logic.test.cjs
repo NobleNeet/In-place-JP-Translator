@@ -122,6 +122,7 @@ const sandbox = {
   fetch: async (url, opts) => {
     server.calls++;
     server.last = { url, opts, body: (opts && opts.body) ? JSON.parse(opts.body) : null };
+    if (server.mode === 'custom') return { ok: true, json: async () => server.response };
     if (server.mode === 'http_error') return { ok: false, status: 500, statusText: 'Internal Server Error', text: async () => 'no such endpoint' };
     if (server.mode === 'json_error') return { ok: true, json: async () => { throw new Error('not json'); }, text: async () => 'not json' };
     if (server.mode === 'empty') return { ok: true, json: async () => ({ choices: [{ message: { content: '' }, finish_reason: 'length' }] }), text: async () => '' };
@@ -615,6 +616,47 @@ async function main() {
   ok('system message only when systemPrompt set', server.last.body.messages.length === 2 &&
     server.last.body.messages[0].role === 'system' && server.last.body.messages[0].content === 'Translate to Japanese.');
 
+  console.log('== CAT-Translate output compatibility ==');
+  const catModel = 'cyberagent/CAT-Translate-1.4b';
+  const sanitize = ns.openaiClient.sanitizeModelOutput;
+  for (const model of [catModel, 'CAT-Translate-1.4b', 'cat-translate-1.4b-q4_k_m', 'cyberagent_CAT-Translate-1.4b-GGUF']) {
+    ok('CAT model variant: ' + model, ns.openaiClient.isCatTranslateModel(model) &&
+      sanitize('これは翻訳です。</s>', model) === 'これは翻訳です。');
+  }
+  ok('removes every exact occurrence', sanitize('A</s>B</s>C', catModel) === 'ABC');
+  const catBatchText = '翻訳1</s>\n翻訳2</s>\n翻訳3</s>';
+  ok('preserves all three batch lines', sanitize(catBatchText, catModel) === '翻訳1\n翻訳2\n翻訳3' &&
+    sanitize(catBatchText, catModel).split('\n').length === 3);
+  const technicalText = 'これは </s> を説明する技術文書です。';
+  ok('other model output unchanged', sanitize(technicalText, 'plamo-2-translate-q4-k-m') === technicalText);
+  ok('HTML unchanged', sanitize('Use <div> and </div> here.', catModel) === 'Use <div> and </div> here.');
+  ok('only exact closing s removed', sanitize('<s></S></s ><div></s></div>', catModel) === '<s></S></s ><div></div>');
+  for (const value of [null, undefined, '']) {
+    ok('nullish/empty output safe: ' + value, sanitize(value, catModel) === '');
+    ok('nullish/empty model unchanged: ' + value, !ns.openaiClient.isCatTranslateModel(value) && sanitize(technicalText, value) === technicalText);
+  }
+  resetServer('custom');
+  const catProfile = Object.assign({}, local, { model: catModel });
+  for (const endpoint of ['chat/completions', 'completions']) {
+    server.response = { choices: [endpoint === 'completions' ? { text: 'これは翻訳です。</s>' } : { message: { content: 'これは翻訳です。</s>' } }] };
+    const result = await ns.openaiClient.translateSegment(Object.assign({}, catProfile, { endpoint }), { id: 'cat', text: 'Translate this' });
+    ok('single sanitized via ' + endpoint, result.id === 'cat' && result.translatedText === 'これは翻訳です。');
+  }
+  server.response = { choices: [{ message: { content: catBatchText } }] };
+  const catRaw = await ns.openaiClient.requestCompletion(catProfile, 'One\nTwo\nThree');
+  ok('sanitized before batch split', catRaw.translatedText === '翻訳1\n翻訳2\n翻訳3');
+  const catBatch = await ns.openaiClient.translateSegments(catProfile, ['One', 'Two', 'Three'].map((text, id) => ({ id, text })));
+  ok('batch aligns sanitized results', catBatch.status === 'aligned' && catBatch.got === 3 &&
+    [0, 1, 2].every(id => catBatch.results[id].translatedText === '翻訳' + (id + 1)));
+  server.response = { choices: [{ message: { content: technicalText } }] };
+  const otherResult = await ns.openaiClient.requestCompletion(Object.assign({}, local, { name: catModel }), 'Technical document');
+  ok('profile name does not trigger sanitize', otherResult.translatedText === technicalText);
+  for (const value of [null, undefined, '', '</s>']) {
+    server.response = { choices: [{ message: { content: value } }] };
+    const result = await ns.openaiClient.requestCompletion(catProfile, 'Empty');
+    ok('empty API output remains an error: ' + value, result.errorType === 'empty_response');
+  }
+
   console.log('== openai client error classes ==');
   resetServer('http_error');
   const rHttp = await ns.openaiClient.translateSegment(local, { id: 'seg-2', text: 'x' }, {});
@@ -797,6 +839,16 @@ async function main() {
   // the profile's model in the POST body, and the profile object itself is
   // never mutated (a later batch without the override must still see the
   // profile's own model).
+  resetServer('custom');
+  server.response = { choices: [{ message: { content: 'モデル翻訳</s>' } }] };
+  const catModelCall = await bgCall({
+    type: ns.constants.MSG_TRANSLATE, id: 'bg-cat-model', profileName: 'local-plamo2', model: catModel,
+    batch: { estimatedTokens: 1, segments: [{ id: 9, text: 'Model me', estimatedTokens: 1, viewport: 1 }] },
+    concurrency: 1, timeoutMs: 5000, cache: {}
+  });
+  ok('dropdown model override controls sanitize in background',
+    server.last.body.model === catModel && catModelCall.payload.results[9].translatedText === 'モデル翻訳');
+  ok('exactly the original two API profiles remain', ns.profiles.profileNames().join(',') === 'evo-x2-plamo2,local-plamo2');
   resetServer('ok');
   const modelCall = await bgCall({
     type: ns.constants.MSG_TRANSLATE, id: 'bg-model', profileName: 'local-plamo2', model: 'llama-3.3-70b',
