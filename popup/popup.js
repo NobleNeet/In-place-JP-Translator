@@ -20,6 +20,49 @@
   var lastError = null;
   var counts = { segments: 0, translated: 0, failed: 0, requests: 0 };
 
+  // Every popup write goes through one chain. saveSettings() is a
+  // load-merge-write, so two overlapping saves can each merge onto the same
+  // base and the later write silently drops the earlier one's patch — most
+  // easily hit now that typing in a system prompt schedules its own save
+  // while a select change saves at the same moment. Chained, each save
+  // merges onto the previous save's result.
+  var saveChain = Promise.resolve();
+  // Set once the popup starts closing: queued chain saves are skipped so a
+  // save that captured older prompt text cannot land after the synchronous
+  // pagehide flush and overwrite the newer text.
+  var closing = false;
+  // Bumped by every synchronous prompt flush. A queued chain save that was
+  // built before the flush carries an older generation and skips its write:
+  // the flush's own full-settings write already contains that patch (every
+  // call site updates `settings` before calling persist), so nothing is
+  // lost and the newest prompt text always wins.
+  var flushGen = 0;
+  function persist(patch) {
+    var gen = flushGen;
+    saveChain = saveChain.then(function () {
+      if (closing || gen !== flushGen) return undefined;
+      return saveSettings(patch);
+    }).then(function (saved) {
+      if (closing || !saved) return saved;
+      settings = saved;
+      return saved;
+    })
+      .catch(function (err) {
+        log.warn('popup: saveSettings failed: ' + String((err && err.message) || err));
+      });
+    return saveChain;
+  }
+
+  // The system prompt is persisted WHILE it is typed, not only on blur:
+  // 'change' fires only when the textarea loses focus after an edit, and
+  // closing the popup destroys the document before that can happen, losing
+  // the last edit. 'input' + a short debounce saves each pause in typing,
+  // and pagehide flushes whatever the debounce still holds when the popup
+  // closes. A run started afterwards — the popup's "Translate Page" or the
+  // page's 和訳 button — reloads settings from storage (content.js
+  // translatePage calls loadSettings() per run), so whatever is saved here
+  // is the system prompt every path sends.
+
   function render() {
     if ($('status')) $('status').textContent = status;
     if ($('segCount')) $('segCount').textContent = counts.segments;
@@ -174,11 +217,15 @@
       box.addEventListener('change', function () { saveApis(box); });
       conc.addEventListener('change', function () { saveApis(null); });
       modelSel.addEventListener('change', function () { saveApis(null); });
+      ta.addEventListener('input', schedulePromptSave);
       ta.addEventListener('change', function () { saveApis(null); });
       reloadBtn.addEventListener('click', function () { refreshModels(name); });
       defBtn.addEventListener('click', function () {
         ta.value = ns.constants.DEFAULT_SYSTEM_PROMPT;
-        saveApis(null);
+        // Same path as typing: the debounced save covers a popup that closes
+        // right after, and promptTouched lets the translate button's
+        // synchronous flush pick the new text up before the run starts.
+        schedulePromptSave();
       });
       host.appendChild(block);
     });
@@ -300,7 +347,7 @@
     // profileName stays the primary server (the fallback plan and the console
     // helpers read it), kept on one that is actually ticked.
     if (enabled.indexOf(settings.profileName) === -1) settings.profileName = enabled[0];
-    saveSettings({ apis: settings.apis, profileName: settings.profileName });
+    persist({ apis: settings.apis, profileName: settings.profileName });
   }
 
   // Reflect the saved settings in the blocks. Nothing ticked in storage (every
@@ -392,6 +439,10 @@
     });
 
     $('translateBtn').addEventListener('click', function () {
+      // Persist the newest prompt text before the run starts, so the content
+      // script's per-run loadSettings() cannot read a stale value (see
+      // flushPromptNow).
+      flushPromptNow();
       lastError = null;
       renderStatus('translating');
       sendToTab({ type: MSG_TRANSLATE_PAGE, id: messaging.makeRequestId('popup') }).then(function (res) {
@@ -465,7 +516,7 @@
 
     $('mode').addEventListener('change', function () {
       settings.mode = $('mode').value;
-      saveSettings({ mode: settings.mode });
+      persist({ mode: settings.mode });
     });
 
     // Packing settings are read by the content script when a run starts, so a
@@ -474,7 +525,7 @@
     if (strategySel) {
       strategySel.addEventListener('change', function () {
         settings.request = Object.assign({}, settings.request, { strategy: clampStrategy($('strategy').value) });
-        saveSettings({ request: settings.request });
+        persist({ request: settings.request });
       });
     }
     var segmentsSel = $('segments');
@@ -483,7 +534,7 @@
         var n = parseInt($('segments').value, 10);
         if (!isFinite(n) || n < 1) return;
         settings.batch = Object.assign({}, settings.batch, { maxSegmentsPerBatch: n });
-        saveSettings({ batch: settings.batch });
+        persist({ batch: settings.batch });
       });
     }
     // The segmenter reads this when a run starts, so it applies to the next
@@ -494,7 +545,7 @@
       hiddenSel.addEventListener('change', function () {
         var defer = $('hidden').value !== 'now';
         settings.priority = Object.assign({}, settings.priority || {}, { deferHidden: defer });
-        saveSettings({ priority: settings.priority });
+        persist({ priority: settings.priority });
       });
     }
     // Which order the next run sorts its segments in (content/priority.js): the
@@ -505,9 +556,63 @@
       orderSel.addEventListener('change', function () {
         var topDown = $('order').value !== 'markup';
         settings.priority = Object.assign({}, settings.priority || {}, { topDown: topDown });
-        saveSettings({ priority: settings.priority });
+        persist({ priority: settings.priority });
       });
     }
+  }
+
+  // Debounced save for the system prompt textareas: one save per typing pause
+  // (readApis() reads the live DOM, so the save always carries the newest
+  // text of every block, not just the one being typed in).
+  var promptSaveTimer = null;
+  // Set on the first keystroke in any prompt box and never cleared: the
+  // pagehide flush then always re-writes the live textareas, which is the
+  // only write that is guaranteed to run before the popup document dies.
+  var promptTouched = false;
+  function schedulePromptSave() {
+    promptTouched = true;
+    if (promptSaveTimer) clearTimeout(promptSaveTimer);
+    promptSaveTimer = setTimeout(function () {
+      promptSaveTimer = null;
+      saveApis(null);
+    }, 250);
+  }
+
+  // Writes the live prompt text to storage with one synchronous set().
+  // Called from two places, both of which must not lose the last keystrokes:
+  //   - the translate button, BEFORE the run message goes out: the set is
+  //     issued before sendMessage, and the content script's loadSettings()
+  //     only runs after that message arrives, so the run - whether started
+  //     here or later by the page's 和訳 button - reads the newest prompt.
+  //   - pagehide: the popup document is destroyed as soon as it closes, so
+  //     the async load-merge-write of saveSettings() can die between its
+  //     two awaits; this single set() is the flush that actually lands (the
+  //     storage write is IPC to the browser process and completes on its
+  //     own). `closing` then stops any queued chain save from overwriting it.
+  // settings is the in-memory copy every persist() keeps current and
+  // readApis() reads the live textareas, so the write carries the newest
+  // text of every field, not just the prompt.
+  function flushPromptNow() {
+    if (!promptTouched) return;
+    if (promptSaveTimer) { clearTimeout(promptSaveTimer); promptSaveTimer = null; }
+    var apis = readApis();
+    var enabled = Object.keys(apis).filter(function (name) { return apis[name].enabled; });
+    if (!enabled.length) return; // never save an empty plan (same rule as saveApis)
+    settings.apis = apis;
+    if (enabled.indexOf(settings.profileName) === -1) settings.profileName = enabled[0];
+    flushGen++;
+    try {
+      chrome.storage.local.set({ plamo: Object.assign({}, settings) });
+    } catch (e) {
+      log.warn('popup: prompt flush failed: ' + String((e && e.message) || e));
+    }
+  }
+
+  if (typeof globalThis.addEventListener === 'function') {
+    globalThis.addEventListener('pagehide', function () {
+      closing = true;
+      flushPromptNow();
+    });
   }
 
   document.addEventListener('DOMContentLoaded', init);
