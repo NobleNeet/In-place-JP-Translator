@@ -62,6 +62,28 @@
     return base + '/' + path;
   }
 
+  // 'http://host:8080/v1' -> 'http://host:8080/v1/models'. The model-list
+  // endpoint every OpenAI-compatible server exposes next to its chat endpoint;
+  // the popup fetches it to fill each API's model dropdown. A base that already
+  // ends in /models is returned as-is so a hand-written full URL still works.
+  function modelsUrl(profile) {
+    var base = normalizeBaseUrl(profile && (profile.url || profile.baseUrl));
+    if (!base) return '';
+    if (/\/models$/.test(base)) return base;
+    return base + '/models';
+  }
+
+  // The system prompt a profile sends when the user has saved no per-API
+  // value: the profile's own systemPrompt if it defines one (the bundled
+  // PLaMo 2 Translate profiles set '' = no system message at all, which is
+  // how a translation-specialised model must be driven), otherwise the
+  // general default from constants. The popup shows exactly this value in the
+  // textarea, so what you see is what gets sent.
+  function effectiveSystemPrompt(profile) {
+    if (profile && profile.systemPrompt != null) return String(profile.systemPrompt);
+    return (ns.constants && ns.constants.DEFAULT_SYSTEM_PROMPT) || '';
+  }
+
   // One log line: "local-plamo2 -> http://127.0.0.1:8080/v1/chat/completions (plamo-2-translate)"
   function describeProfile(profile) {
     if (!profile) return 'none';
@@ -76,6 +98,8 @@
     normalizeBaseUrl: normalizeBaseUrl,
     endpointPath: endpointPath,
     resolveEndpointUrl: resolveEndpointUrl,
+    modelsUrl: modelsUrl,
+    effectiveSystemPrompt: effectiveSystemPrompt,
     describeProfile: describeProfile
   };
 })();

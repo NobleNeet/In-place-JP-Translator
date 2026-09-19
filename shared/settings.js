@@ -102,17 +102,27 @@
   }
 
   // Stored per-API entries are trusted no further than the numbers already
-  // are: `enabled` becomes a real boolean, and `concurrency` is either a legal
-  // option or null, which means "inherit settings.maxConcurrent".
+  // are: `enabled` becomes a real boolean, `concurrency` is either a legal
+  // option or null (which means "inherit settings.maxConcurrent"), and the
+  // per-API model / system prompt ride along as strings.
+  //   model: '' means "use the profile's own model" (api/profiles.js).
+  //   systemPrompt: undefined means "never set - use the profile's own";
+  //   '' means "explicitly no system message at all", which is how a
+  //   translation-specialised model (plamo2translate) is meant to be driven.
+  //   Keeping the undefined-vs-empty distinction end to end is what lets a
+  //   custom profile keep its own prompt while a cleared box still sends none.
   function normalizeApis(raw) {
     var out = {};
     Object.keys(raw || {}).forEach(function (name) {
       var e = raw[name] || {};
       var n = parseInt(e.concurrency, 10);
-      out[name] = {
+      var entry = {
         enabled: !!e.enabled,
-        concurrency: (Number.isFinite(n) && n >= 1) ? clampConcurrent(n) : null
+        concurrency: (Number.isFinite(n) && n >= 1) ? clampConcurrent(n) : null,
+        model: String(e.model == null ? '' : e.model).trim()
       };
+      if (e.systemPrompt != null) entry.systemPrompt = String(e.systemPrompt);
+      out[name] = entry;
     });
     return out;
   }
@@ -128,10 +138,16 @@
     var out = [];
     Object.keys(apis).forEach(function (name) {
       var e = apis[name];
-      if (e && e.enabled) out.push({ name: name, concurrency: e.concurrency || maxConcurrent });
+      if (e && e.enabled) {
+        var server = { name: name, concurrency: e.concurrency || maxConcurrent, model: e.model || '' };
+        if (e.systemPrompt != null) server.systemPrompt = e.systemPrompt;
+        out.push(server);
+      }
     });
     if (!out.length) {
-      out.push({ name: (settings && settings.profileName) || C.DEFAULT_PROFILE, concurrency: maxConcurrent });
+      // Legacy single-profile fallback: the profile's own model and prompt,
+      // at maxConcurrent (no per-API overrides).
+      out.push({ name: (settings && settings.profileName) || C.DEFAULT_PROFILE, concurrency: maxConcurrent, model: '' });
     }
     return out;
   }

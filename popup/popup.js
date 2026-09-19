@@ -83,55 +83,203 @@
     render();
   }
 
-  // One row per API profile (api/profiles.js): a tick box for "use this
-  // server" and its own concurrency select. Tick several and a run sends its
-  // batches through all of them at once: the batches wait in one queue on the
-  // page and a server takes the next one when it has a free slot, so the
-  // concurrency set here is that server's own bound (translation/dispatch.js).
-  // A busy server ends up with fewer batches; it never holds the others' work
-  // hostage, and the two settings do not have to match each other.
+  // One block per API profile (api/profiles.js): a tick box for "use this
+  // server", its own concurrency select, a model dropdown fed by the
+  // server's GET /models endpoint, and its own system prompt textarea. Tick
+  // several and a run sends its batches through all of them at once: the
+  // batches wait in one queue on the page and a server takes the next one
+  // when it has a free slot, so the concurrency set here is that server's
+  // own bound (translation/dispatch.js).
+  //
+  // Model and system prompt are per-API and independent: each server runs
+  // the model picked in ITS dropdown with THE SYSTEM PROMPT TYPED IN ITS OWN
+  // box. An empty box sends no system message at all, which is what a
+  // translation-specialised model (plamo2translate) needs; the bundled
+  // profiles ship with an empty prompt for exactly that reason, and the
+  // "default" button fills in the general-purpose prompt from constants for
+  // a general LLM.
   function populateApis() {
     var host = $('apis');
     if (!host) return;
     profileNames().forEach(function (name) {
+      var block = document.createElement('div');
+      block.className = 'api-block';
+      block.setAttribute('data-profile', name);
+
+      // Row 1: tick box + name + this server's own concurrency.
       var row = document.createElement('div');
       row.className = 'api-row';
-      row.setAttribute('data-profile', name);
-
       var label = document.createElement('label');
       label.className = 'api-name';
       var box = document.createElement('input');
       box.type = 'checkbox';
+      box.className = 'api-enabled';
       label.appendChild(box);
       label.appendChild(document.createTextNode(' ' + name));
       row.appendChild(label);
 
-      var sel = document.createElement('select');
-      sel.title = 'concurrent requests for this server';
+      var conc = document.createElement('select');
+      conc.className = 'api-conc';
+      conc.title = 'concurrent requests for this server';
       ns.constants.CONCUR_OPTIONS.forEach(function (n) {
         var opt = document.createElement('option');
         opt.value = String(n);
         opt.textContent = String(n);
-        sel.appendChild(opt);
+        conc.appendChild(opt);
       });
-      row.appendChild(sel);
+      row.appendChild(conc);
+      block.appendChild(row);
+
+      // Row 2: the model dropdown (filled from GET <base>/models) + reload.
+      var mrow = document.createElement('div');
+      mrow.className = 'api-row';
+      var modelSel = document.createElement('select');
+      modelSel.className = 'api-model';
+      modelSel.title = 'model this server translates with (from its /models endpoint)';
+      mrow.appendChild(modelSel);
+      var reloadBtn = document.createElement('button');
+      reloadBtn.className = 'api-reload';
+      reloadBtn.type = 'button';
+      reloadBtn.title = 'reload the model list from ' + ns.profiles.modelsUrl(ns.profiles.getProfile(name));
+      reloadBtn.textContent = '\u21bb';
+      mrow.appendChild(reloadBtn);
+      block.appendChild(mrow);
+
+      var modelsHint = document.createElement('div');
+      modelsHint.className = 'api-models hint';
+      modelsHint.textContent = 'models: loading\u2026';
+      block.appendChild(modelsHint);
+
+      // Row 3: this API's own system prompt.
+      var prow = document.createElement('div');
+      prow.className = 'api-prompt-label';
+      var plabel = document.createElement('span');
+      plabel.textContent = 'System prompt';
+      prow.appendChild(plabel);
+      var defBtn = document.createElement('button');
+      defBtn.className = 'api-prompt-default';
+      defBtn.type = 'button';
+      defBtn.title = 'fill the default translation prompt (empty box = send no system prompt)';
+      defBtn.textContent = 'use default';
+      prow.appendChild(defBtn);
+      block.appendChild(prow);
+
+      var ta = document.createElement('textarea');
+      ta.className = 'api-system';
+      ta.rows = 3;
+      ta.spellcheck = false;
+      ta.placeholder = 'empty = send no system prompt (required for translation-specialised models)';
+      block.appendChild(ta);
 
       box.addEventListener('change', function () { saveApis(box); });
-      sel.addEventListener('change', function () { saveApis(null); });
-      host.appendChild(row);
+      conc.addEventListener('change', function () { saveApis(null); });
+      modelSel.addEventListener('change', function () { saveApis(null); });
+      ta.addEventListener('change', function () { saveApis(null); });
+      reloadBtn.addEventListener('click', function () { refreshModels(name); });
+      defBtn.addEventListener('click', function () {
+        ta.value = ns.constants.DEFAULT_SYSTEM_PROMPT;
+        saveApis(null);
+      });
+      host.appendChild(block);
     });
   }
 
-  function apiRows() { return document.querySelectorAll('.api-row'); }
+  function apiBlocks() { return document.querySelectorAll('.api-block'); }
 
-  // Everything typed into the rows, keyed by profile name.
+  // Make sure `value` is selectable in `sel` (a saved model the fetched list
+  // does not contain still has to show up, marked so it is not mistaken for
+  // a live one). Returns the option that was added, if any.
+  function ensureOption(sel, value, suffix) {
+    if (!value) return null;
+    var found = Array.prototype.some.call(sel.options, function (o) { return o.value === value; });
+    if (found) return null;
+    var opt = document.createElement('option');
+    opt.value = value;
+    opt.textContent = value + (suffix ? (' ' + suffix) : '');
+    sel.insertBefore(opt, sel.firstChild);
+    return opt;
+  }
+
+  // GET <base>/models for one profile and fill its dropdown. The popup has
+  // the same host_permissions as the worker, so this is the same server the
+  // batches go to. A failure is shown in the block's hint and leaves the
+  // current selection alone: a server that is down for /models can still be
+  // translated with (the profile's own model name is kept).
+  function refreshModels(name) {
+    var block = document.querySelector('.api-block[data-profile="' + name + '"]');
+    if (!block) return;
+    var sel = block.querySelector('.api-model');
+    var hint = block.querySelector('.api-models');
+    var profile = ns.profiles.getProfile(name);
+    var url = ns.profiles.modelsUrl(profile);
+    if (!url) {
+      hint.textContent = 'models: no base url configured';
+      return;
+    }
+    hint.textContent = 'models: loading\u2026';
+    var opts = { method: 'GET', headers: {} };
+    if (profile.apiKey) opts.headers['Authorization'] = 'Bearer ' + profile.apiKey;
+    var ctrl = new AbortController();
+    var timer = setTimeout(function () { ctrl.abort(); }, 8000);
+    opts.signal = ctrl.signal;
+    fetch(url, opts).then(function (res) {
+      if (!res.ok) throw new Error(res.status + ' ' + res.statusText);
+      return res.json();
+    }).then(function (json) {
+      clearTimeout(timer);
+      var raw = (json && json.data) || [];
+      var ids = raw.map(function (m) { return m && (m.id || m.model || m.name); })
+        .filter(function (id) { return typeof id === 'string' && id.length; });
+      if (!ids.length) throw new Error('no models in the response');
+      var current = sel.value || profile.model || '';
+      sel.innerHTML = '';
+      ids.forEach(function (id) {
+        var opt = document.createElement('option');
+        opt.value = id;
+        opt.textContent = id;
+        sel.appendChild(opt);
+      });
+      // Keep whatever was selected (or saved) even if the server no longer
+      // lists it; otherwise fall back to the profile's own model.
+      var keep = current || profile.model || '';
+      if (keep) {
+        ensureOption(sel, keep, '(not listed)');
+        sel.value = keep;
+      }
+      hint.textContent = ids.length + ' model(s) from ' + url;
+    }).catch(function (err) {
+      clearTimeout(timer);
+      // Keep the dropdown usable: the profile's own model is the only choice.
+      if (!sel.options.length && profile.model) {
+        var opt = document.createElement('option');
+        opt.value = profile.model;
+        opt.textContent = profile.model;
+        sel.appendChild(opt);
+      }
+      hint.textContent = 'models: ' + String((err && err.message) || err) + ' (using the profile model)';
+      log.warn('popup: /models failed for ' + name + ' ' + url + ': ' + String((err && err.message) || err));
+    });
+  }
+
+  function refreshAllModels() {
+    profileNames().forEach(function (name) { refreshModels(name); });
+  }
+
+  // Everything typed into the blocks, keyed by profile name.
   function readApis() {
     var apis = {};
-    Array.prototype.forEach.call(apiRows(), function (row) {
-      var name = row.getAttribute('data-profile');
-      var box = row.querySelector('input[type="checkbox"]');
-      var sel = row.querySelector('select');
-      apis[name] = { enabled: !!box.checked, concurrency: clampConcurrent(sel.value) };
+    Array.prototype.forEach.call(apiBlocks(), function (block) {
+      var name = block.getAttribute('data-profile');
+      var box = block.querySelector('.api-enabled');
+      var conc = block.querySelector('.api-conc');
+      var modelSel = block.querySelector('.api-model');
+      var ta = block.querySelector('.api-system');
+      apis[name] = {
+        enabled: !!box.checked,
+        concurrency: clampConcurrent(conc.value),
+        model: (modelSel && modelSel.value) ? String(modelSel.value).trim() : '',
+        systemPrompt: ta ? String(ta.value) : ''
+      };
     });
     return apis;
   }
@@ -155,31 +303,54 @@
     saveSettings({ apis: settings.apis, profileName: settings.profileName });
   }
 
-  // Reflect the saved settings in the rows. Nothing ticked in storage (every
+  // Reflect the saved settings in the blocks. Nothing ticked in storage (every
   // install saved before per-API settings existed) shows as exactly one tick —
   // the primary profile at the old shared concurrency, which is what it has
   // been doing all along.
   function renderApis() {
     var saved = settings.apis || {};
     var anyTicked = Object.keys(saved).some(function (name) { return saved[name] && saved[name].enabled; });
-    Array.prototype.forEach.call(apiRows(), function (row) {
-      var name = row.getAttribute('data-profile');
+    Array.prototype.forEach.call(apiBlocks(), function (block) {
+      var name = block.getAttribute('data-profile');
       var entry = saved[name];
-      var box = row.querySelector('input[type="checkbox"]');
-      var sel = row.querySelector('select');
+      var profile = ns.profiles.getProfile(name);
+      var box = block.querySelector('.api-enabled');
+      var conc = block.querySelector('.api-conc');
+      var modelSel = block.querySelector('.api-model');
+      var ta = block.querySelector('.api-system');
       box.checked = anyTicked ? !!(entry && entry.enabled) : (name === settings.profileName);
-      var conc = (entry && entry.concurrency) || settings.maxConcurrent;
+      var c = (entry && entry.concurrency) || settings.maxConcurrent;
       // A saved limit that is not one of the presets (typed into storage, or an
       // older option list) still has to show up in the select.
-      var preset = Array.prototype.some.call(sel.options, function (o) { return o.value === String(conc); });
+      var preset = Array.prototype.some.call(conc.options, function (o) { return o.value === String(c); });
       if (!preset) {
         var extra = document.createElement('option');
-        extra.value = String(conc);
-        extra.textContent = String(conc) + ' (saved)';
-        sel.appendChild(extra);
+        extra.value = String(c);
+        extra.textContent = String(c) + ' (saved)';
+        conc.appendChild(extra);
       }
-      sel.value = String(conc);
+      conc.value = String(c);
+      // The model dropdown starts with what is saved (or the profile's own
+      // model) while the /models fetch runs; refreshModels() replaces the list
+      // and keeps this selection, marking it "(not listed)" if the server no
+      // longer offers it.
+      var savedModel = (entry && entry.model) || profile.model || '';
+      if (savedModel) {
+        var mo = document.createElement('option');
+        mo.value = savedModel;
+        mo.textContent = savedModel;
+        modelSel.appendChild(mo);
+        modelSel.value = savedModel;
+      }
+      // The textarea shows exactly what a run would send for this API right
+      // now: the saved per-API prompt, else the profile's own, else the
+      // general default. An empty box means no system message at all.
+      if (ta) {
+        ta.value = (entry && entry.systemPrompt != null) ? entry.systemPrompt
+          : ns.profiles.effectiveSystemPrompt(profile);
+      }
     });
+    refreshAllModels();
   }
 
   function init() {

@@ -79,8 +79,21 @@ hr {
   font-weight: 600;
 }
 
-/* API server rows: tick box + name on the left, its own concurrency on the
-   right (popup.js builds one .api-row per profile in api/profiles.js) */
+/* API server blocks: tick box + name + its own concurrency on the first row,
+   the model dropdown (from GET /models) + reload on the second, and the
+   per-API system prompt textarea below (popup.js builds one .api-block per
+   profile in api/profiles.js) */
+.api-block {
+  border: 1px solid #e2e2e2;
+  border-radius: 6px;
+  padding: 8px;
+  margin-bottom: 8px;
+}
+
+.api-block:last-child {
+  margin-bottom: 0;
+}
+
 .api-row {
   display: flex;
   align-items: center;
@@ -108,9 +121,62 @@ hr {
 }
 
 .api-row select {
+  margin-top: 0;
+}
+
+.api-conc {
   width: 72px;
   flex: none;
-  margin-top: 0;
+}
+
+.api-model {
+  flex: 1 1 0;
+  min-width: 0;
+  font-size: 12px;
+}
+
+.api-reload {
+  width: 28px;
+  flex: none;
+  padding: 4px 0;
+  font-size: 14px;
+  line-height: 1;
+}
+
+/* .api-block prefix so the later .hint rule (same single-class specificity)
+   does not override the compact spacing this line needs */
+.api-block .api-models {
+  margin: 0 0 6px;
+  font-size: 11px;
+  color: #777;
+  overflow-wrap: anywhere;
+}
+
+.api-prompt-label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12px;
+  color: #555;
+  margin-bottom: 2px;
+}
+
+.api-prompt-default {
+  font-size: 11px;
+  padding: 2px 6px;
+}
+
+.api-system {
+  width: 100%;
+  box-sizing: border-box;
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 11px;
+  padding: 4px;
+  border: 1px solid #bbb;
+  border-radius: 4px;
+  resize: vertical;
+  margin-bottom: 4px;
 }
 
 /* diagnostics hints (popup.js writes #lastError with class="hint error") */

@@ -500,6 +500,8 @@
           batch: messaging.toWireBatch(chunkBatch),
           profileName: (api && api.name) || settings.profileName,
           concurrency: (api && api.concurrency) || settings.maxConcurrent,
+          model: (api && api.model) || undefined,
+          systemPrompt: (api && api.systemPrompt),
           strategy: (settings.request && settings.request.strategy) || undefined,
           request: settings.request || undefined,
           cache: messaging.toWireCache(cache, chunkBatch.segments)
@@ -587,6 +589,12 @@
           batch: messaging.toWireBatch(chunkBatch),
           profileName: api.name,
           concurrency: api.concurrency,
+          model: (api && api.model) || undefined,
+          // The one thing this round changes: the batched system prompt. It
+          // rides on the dedicated field so it wins over whatever the API's
+          // own saved prompt is (including an empty one) — the whole point of
+          // the round is the explicit do-not-copy instruction.
+          systemPrompt: ECHO_RETRY_PROMPT,
           strategy: (settings.request && settings.request.strategy) || undefined,
           // The one thing this round changes: the batched system prompt.
           request: Object.assign({}, settings.request || {}, { batchSystemPrompt: ECHO_RETRY_PROMPT }),
@@ -752,6 +760,13 @@
             type: MSG_TRANSLATE,
             batch: messaging.toWireBatch(job.batch),
             profileName: server.name,
+            // The server's own model + system prompt (popup per-API settings)
+            // ride along so every batch of the run uses what the user picked
+            // for THAT server. Both may be empty: empty model = the profile's
+            // own model, empty systemPrompt = no system message at all, which
+            // is how a translation-specialised model is driven.
+            model: server.model || undefined,
+            systemPrompt: server.systemPrompt,
             // The server's own limit rides along so the worker bounds THAT
             // server's queue too: the per-segment retries a batch adds inside the
             // worker are its own doing, and this side cannot count them.

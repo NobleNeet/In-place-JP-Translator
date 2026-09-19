@@ -39,6 +39,17 @@
     MODES: ['single', 'fallback', 'balanced'],
     CONCUR_OPTIONS: [1, 2, 4, 8],
 
+    // The system prompt a general LLM gets when nothing else defines one. A
+    // translation-specialised model (PLaMo 2 Translate) must NOT be driven
+    // with one, so the bundled profiles keep systemPrompt: '' and the popup
+    // shows an empty box for them; this default only applies to a profile
+    // that leaves the field out entirely. Empty is always a legal value:
+    // no system message is sent at all (api/openai-client.js buildMessages).
+    DEFAULT_SYSTEM_PROMPT:
+      'You are a translator. Translate each line of the user message from English into natural Japanese. ' +
+      'Keep the number of lines exactly the same: one translated line per input line, in the same order. ' +
+      'Output only the translation, with no explanations, numbering, or code fences.',
+
     // A batch is now ONE API request (see api/openai-client.js translateSegments):
     // every segment of a batch travels as one line of a single prompt, so the
     // caps below are caps on a request, not on a message. Batching saves the

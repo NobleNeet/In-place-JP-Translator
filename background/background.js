@@ -154,8 +154,24 @@ importScripts(
     }
 
     var profile = profiles.getProfile(opts.profileName);
+    // The popup's per-API model dropdown rides along as `model`: a non-empty
+    // value overrides the profile's own model for this batch (a shallow copy,
+    // so the shared profile object is never mutated). Empty keeps the
+    // profile's model.
+    if (opts.model) profile = Object.assign({}, profile, { model: String(opts.model) });
     var semaphore = semaphoreFor(profile.name); // the batch's own API gets its own limiter
     var R = Object.assign({}, C.REQUEST_SETTINGS, opts.request || {});
+    // The system prompt for this batch, in priority order:
+    //   1. opts.systemPrompt - the per-API prompt the popup saved. Defined
+    //      even as the empty string, and '' means "send no system message at
+    //      all", which is how a translation-specialised model (plamo2translate)
+    //      must be driven; the popup shows the empty box for such a profile.
+    //   2. request.batchSystemPrompt - the old global batch instruction.
+    //   3. the profile's own systemPrompt, else the general default from
+    //      constants (profiles.effectiveSystemPrompt). The bundled PLaMo 2
+    //      profiles set '' here, so they stay prompt-free either way.
+    var systemPrompt = (opts.systemPrompt != null) ? String(opts.systemPrompt)
+      : (R.batchSystemPrompt || profiles.effectiveSystemPrompt(profile));
     var strategy = (C.REQUEST_STRATEGIES.indexOf(opts.strategy) !== -1) ? opts.strategy : (R.strategy || C.REQUEST_SETTINGS.strategy);
     var explicitTimeout = (typeof opts.timeoutMs === 'number' && opts.timeoutMs > 0);
     // A request that is *allowed* to run for minutes is not a patient client, it
@@ -248,7 +264,7 @@ importScripts(
         }, ns.openaiClient.translateSegments(profile, segments, {
           timeoutMs: batchTimeoutMs,
           format: format,
-          systemPrompt: R.batchSystemPrompt || undefined,
+          systemPrompt: systemPrompt,
           maxTokens: R.maxTokensPerRequest || undefined
         }));
         var ms = Math.round(performance.now() - reqT0);
@@ -298,7 +314,7 @@ importScripts(
       return guarded(guardMs, function () {
         results[segment.id] = { id: segment.id, text: segment.text, error: 'no result within ' + guardMs + 'ms', errorType: 'timeout' };
         log.warn(tag + ' seg#' + segment.id + ' GUARD TIMEOUT after ' + guardMs + 'ms text=' + preview);
-      }, translateSegment(profile, segment, { timeoutMs: timeoutMs })).then(function (out) {
+      }, translateSegment(profile, segment, { timeoutMs: timeoutMs, systemPrompt: systemPrompt })).then(function (out) {
         if (out.timedOut) return;
         var ms = Math.round(performance.now() - t1);
         if (out.error) {
@@ -458,6 +474,9 @@ importScripts(
       running = Promise.resolve(translateBatch(msg.batch, {
         requestId: requestId,
         profileName: msg.profileName || msg.profile,
+        // The popup's per-API choices (model dropdown + system prompt box).
+        model: msg.model,
+        systemPrompt: msg.systemPrompt,
         concurrency: msg.concurrency,
         timeoutMs: msg.timeoutMs,
         strategy: msg.strategy,

@@ -39,7 +39,10 @@
   var ns = globalThis.__PLAMO__;
   var log = ns.logger.log;
 
-  // servers: [{ name, concurrency }] - one entry per API the run sends through.
+  // servers: [{ name, concurrency, model?, systemPrompt? }] - one entry per
+  // API the run sends through. `model` / `systemPrompt` are carried through
+  // untouched so callers that re-address work by pool entry (the echo-retry
+  // round in content.js) still send the user's per-API choices.
   // send(item, server) starts the work for one item. Whatever it returns is
   // awaited, and the server's slot is released when it settles; a rejection
   // counts as finished, because a request that died must not occupy a slot
@@ -56,12 +59,15 @@
       if (!name || named[name]) return;
       var n = parseInt(api && api.concurrency, 10);
       named[name] = true;
-      pool.push({
+      var srv = {
         name: name,
         concurrency: (Number.isFinite(n) && n >= 1) ? Math.floor(n) : 1,
         active: 0,
         dispatched: 0
-      });
+      };
+      if (api.model != null) srv.model = api.model;
+      if (api.systemPrompt != null) srv.systemPrompt = api.systemPrompt;
+      pool.push(srv);
     });
     // A run with no usable server entry still has to translate something.
     if (!pool.length) pool.push({ name: 'default', concurrency: 1, active: 0, dispatched: 0 });

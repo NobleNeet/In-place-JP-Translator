@@ -105,11 +105,63 @@ API profiles live in [`api/profiles.js`](api/profiles.js). `url` is the
   sent at all** (see `api/openai-client.js`).
 - `systemPrompt` is empty on purpose: PLaMo 2 Translate is a translation model,
   so the raw English text is sent as the only message. Setting a system prompt
-  adds a `system` message before it for models that need one.
+  adds a `system` message before it for models that need one. The popup can set
+  this per API at runtime (see below), so the profile value is only the
+  starting point.
 
 Every request is logged as
 `request <profile> POST <resolved url> model=... kind=... chars=...`, so a wrong
 URL is visible immediately in the console.
+
+### Choosing a model and a system prompt per API
+
+Every API block in the popup has its own **model dropdown** and its own **system
+prompt textarea**, saved under `apis.<profile>` next to `enabled` /
+`concurrency`:
+
+```json
+{ "evo-x2-plamo2": {
+    "enabled": true,
+    "concurrency": 2,
+    "model": "llama-3.3-70b-instruct",
+    "systemPrompt": "You are a translator. Translate each line..."
+} }
+```
+
+- **Model list.** The dropdown is filled from the server's OpenAI-compatible
+  `GET <base>/models` (`profiles.modelsUrl()`), fetched when the popup opens and
+  again from the **↻** button. `apiKey` is sent as a bearer token when the
+  profile has one. The list is per server, so two servers can run different
+  models in the same run. If the endpoint is unreachable the block says so and
+  keeps the profile's own model, so a server that is down for `/models` can
+  still be translated with; a saved model the server no longer lists stays
+  selectable and is marked `(not listed)`.
+- **System prompt.** The textarea shows exactly what a run sends for that API
+  right now, and edits apply to the next **Translate Page** press. The value is
+  per API and independent: the same prompt is *not* shared between servers.
+  - **Empty box = no system message is sent at all.** This is what a
+    translation-specialised model (PLaMo 2 Translate) needs: a system prompt
+    gets in its way, so the bundled profiles ship with an empty prompt and the
+    popup shows an empty box for them. A run works unchanged with the box
+    empty.
+  - **`use default`** fills in `constants.DEFAULT_SYSTEM_PROMPT`, a general
+    "translate each line to Japanese, keep the line count" instruction for a
+    general LLM that does not know it is a translator. Use it when you pick a
+    general model from the dropdown.
+  - The priority a request resolves is:
+    `apis.<profile>.systemPrompt` (the box, **even when empty**) →
+    `request.batchSystemPrompt` (the old global setting) →
+    `profiles.effectiveSystemPrompt(profile)` (the profile's own, else the
+    general default). The empty string winning at the top of that chain is what
+    keeps a cleared box meaning "no prompt".
+  - The echo-retry round (`ECHO_RETRY_PROMPT` in `content/content.js`) still
+    overrides the saved prompt with its explicit do-not-copy instruction.
+- **Model override.** A non-empty `model` on the request replaces the
+  profile's model for that batch (a shallow copy of the profile, so nothing
+  shared is mutated); an empty one keeps the profile's model.
+- **Nothing to configure for a translation model.** With the box empty and the
+  profile's own model selected, the request is exactly what it was before this
+  feature: the raw text, no system message.
 
 ### Using several APIs at the same time
 

@@ -350,6 +350,29 @@ async function main() {
       apis: { 'evo-x2-plamo2': { enabled: false } } });
       return o.length === 1 && o[0].name === 'local-plamo2' && o[0].concurrency === 2; })());
 
+  console.log('== per-API model + system prompt (settings.apis) ==');
+  await chromeFake.storage.local.set({ plamo: { profileName: 'local-plamo2', maxConcurrent: 2,
+    apis: { 'evo-x2-plamo2': { enabled: true, concurrency: 2, model: 'gpt-4o-mini', systemPrompt: 'Translate formally.' },
+            'local-plamo2': { enabled: true, concurrency: 1, model: '', systemPrompt: '' },
+            legacy: { enabled: true, concurrency: 1 } } } });
+  const withModels = await ns.settings.loadSettings();
+  ok('a saved per-API model survives loading',
+    withModels.apis['evo-x2-plamo2'].model === 'gpt-4o-mini', JSON.stringify(withModels.apis));
+  ok('a saved per-API system prompt survives loading',
+    withModels.apis['evo-x2-plamo2'].systemPrompt === 'Translate formally.');
+  ok('an explicitly empty system prompt stays the empty string (= send no system message)',
+    withModels.apis['local-plamo2'].systemPrompt === '');
+  ok('an entry saved before the model field existed keeps model empty and prompt undefined',
+    withModels.apis.legacy.model === '' && withModels.apis.legacy.systemPrompt === undefined,
+    withModels.apis.legacy);
+  const actM = ns.settings.activeApis(withModels);
+  ok('activeApis carries the per-API model and prompt through to the run',
+    actM[0].model === 'gpt-4o-mini' && actM[0].systemPrompt === 'Translate formally.' &&
+    actM[1].model === '' && actM[1].systemPrompt === '', JSON.stringify(actM));
+  ok('the legacy single-profile fallback carries no per-API prompt override',
+    (() => { const o = ns.settings.activeApis({ profileName: 'local-plamo2', maxConcurrent: 2 });
+      return o.length === 1 && o[0].model === '' && o[0].systemPrompt === undefined; })());
+
   console.log('== the run dispatches itself over the servers (translation/dispatch.js) ==');
   const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -548,6 +571,18 @@ async function main() {
   ok('default endpoint when unset', ns.profiles.resolveEndpointUrl({ url: 'http://h:1/v1' }) === 'http://h:1/v1/chat/completions');
   ok('already-full url kept', ns.profiles.resolveEndpointUrl({ url: 'http://h:1/v1/chat/completions' }) === 'http://h:1/v1/chat/completions');
   ok('describeProfile logs resolved url', ns.profiles.describeProfile(evo).includes('http://192.168.50.28:8080/v1/chat/completions'));
+
+  console.log('== models endpoint + effective system prompt (api/profiles.js) ==');
+  ok('models url from a base url', ns.profiles.modelsUrl(local) === 'http://127.0.0.1:8080/v1/models');
+  ok('models url trims a trailing slash', ns.profiles.modelsUrl({ url: 'http://h:1/v1/' }) === 'http://h:1/v1/models');
+  ok('a full /models url is kept as-is', ns.profiles.modelsUrl({ url: 'http://h/v1/models' }) === 'http://h/v1/models');
+  ok('no base url means no models url', ns.profiles.modelsUrl({ url: '' }) === '');
+  ok('a profile that sets its own prompt uses it (empty stays empty: no system message)',
+    ns.profiles.effectiveSystemPrompt(local) === '');
+  ok('a profile with no systemPrompt field gets the general default',
+    ns.profiles.effectiveSystemPrompt({ name: 'general-llm' }) === ns.constants.DEFAULT_SYSTEM_PROMPT);
+  ok('an explicitly empty profile prompt is respected over the default',
+    ns.profiles.effectiveSystemPrompt({ systemPrompt: '' }) === '');
 
   console.log('== openai client request shape ==');
   resetServer('ok');
@@ -757,6 +792,78 @@ async function main() {
   const snapApis = ns.background.snapshot().apis;
   ok('the snapshot breaks the limiter down per API', !!snapApis && snapApis['evo-x2-plamo2'].limit === 8 &&
     snapApis['local-plamo2'].limit === 4, JSON.stringify(snapApis));
+
+  // The per-API model dropdown: a non-empty `model` on the message replaces
+  // the profile's model in the POST body, and the profile object itself is
+  // never mutated (a later batch without the override must still see the
+  // profile's own model).
+  resetServer('ok');
+  const modelCall = await bgCall({
+    type: ns.constants.MSG_TRANSLATE, id: 'bg-model', profileName: 'local-plamo2', model: 'llama-3.3-70b',
+    batch: { estimatedTokens: 1, segments: [{ id: 9, text: 'Model me', estimatedTokens: 1, viewport: 1 }] },
+    concurrency: 1, timeoutMs: 5000, cache: {}
+  });
+  ok('a per-API model override reaches the request body',
+    modelCall.payload.status === 'success' && server.last.body.model === 'llama-3.3-70b',
+    server.last.body.model);
+  ok('the shared profile keeps its own model (no mutation)',
+    ns.profiles.getProfile('local-plamo2').model === 'plamo-2-translate-iq4-xs');
+
+  // The per-API system prompt: a non-empty value becomes the system message.
+  resetServer('ok');
+  await bgCall({
+    type: ns.constants.MSG_TRANSLATE, id: 'bg-sys', profileName: 'local-plamo2',
+    systemPrompt: 'Translate politely.',
+    batch: { estimatedTokens: 1, segments: [{ id: 10, text: 'Prompt me', estimatedTokens: 1, viewport: 1 }] },
+    concurrency: 1, timeoutMs: 5000, cache: {}
+  });
+  ok('a per-API system prompt becomes the system message',
+    server.last.body.messages.length === 2 && server.last.body.messages[0].role === 'system' &&
+    server.last.body.messages[0].content === 'Translate politely.', JSON.stringify(server.last.body.messages));
+
+  // The empty string is a real choice: a translation-specialised model must
+  // get NO system message even though the general default exists. This is the
+  // plamo2translate case from the requirements.
+  resetServer('ok');
+  await bgCall({
+    type: ns.constants.MSG_TRANSLATE, id: 'bg-nosys', profileName: 'local-plamo2', systemPrompt: '',
+    batch: { estimatedTokens: 1, segments: [{ id: 11, text: 'No prompt please', estimatedTokens: 1, viewport: 1 }] },
+    concurrency: 1, timeoutMs: 5000, cache: {}
+  });
+  ok('an empty per-API system prompt sends no system message at all',
+    !server.last.body.messages.some((m) => m.role === 'system') &&
+    server.last.body.messages.length === 1, JSON.stringify(server.last.body.messages));
+
+  // No per-API prompt at all: the old chain still works, and the bundled
+  // PLaMo 2 profiles (systemPrompt: '') stay prompt-free.
+  resetServer('ok');
+  await bgCall({
+    type: ns.constants.MSG_TRANSLATE, id: 'bg-chain', profileName: 'local-plamo2',
+    batch: { estimatedTokens: 1, segments: [{ id: 12, text: 'Chain', estimatedTokens: 1, viewport: 1 }] },
+    concurrency: 1, timeoutMs: 5000, cache: {}
+  });
+  ok('no per-API prompt on a bundled profile still sends no system message',
+    !server.last.body.messages.some((m) => m.role === 'system'));
+  resetServer('ok');
+  await bgCall({
+    type: ns.constants.MSG_TRANSLATE, id: 'bg-batchsys', profileName: 'local-plamo2',
+    request: { batchSystemPrompt: 'Old global instruction.' },
+    batch: { estimatedTokens: 1, segments: [{ id: 13, text: 'Legacy', estimatedTokens: 1, viewport: 1 }] },
+    concurrency: 1, timeoutMs: 5000, cache: {}
+  });
+  ok('the old global batchSystemPrompt still works when no per-API prompt is set',
+    server.last.body.messages[0].role === 'system' &&
+    server.last.body.messages[0].content === 'Old global instruction.');
+  // And the per-API prompt wins over the old global one.
+  resetServer('ok');
+  await bgCall({
+    type: ns.constants.MSG_TRANSLATE, id: 'bg-win', profileName: 'local-plamo2', systemPrompt: 'Per-API wins.',
+    request: { batchSystemPrompt: 'Old global instruction.' },
+    batch: { estimatedTokens: 1, segments: [{ id: 14, text: 'Priority', estimatedTokens: 1, viewport: 1 }] },
+    concurrency: 1, timeoutMs: 5000, cache: {}
+  });
+  ok('the per-API prompt wins over the global batchSystemPrompt',
+    server.last.body.messages[0].content === 'Per-API wins.');
 
   const pingCall = await bgCall({ type: ns.constants.MSG_PING, id: 'bg-ping' });
   ok('ping answered synchronously', pingCall.returned === false && pingCall.payload.pong === true);
