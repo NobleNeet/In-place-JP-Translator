@@ -12,9 +12,13 @@
 //    exactly. A hash collision therefore can never mistranslate a sentence -
 //    it degrades to a cache miss.
 //
-// 2. Only landed translations are stored. content.js feeds this cache from
-//    applyBatchResults() and from nothing else, so an echo, a self-identical
-//    answer, or a half-written node never enters persistent storage.
+// 2. Only processed results are stored. content.js feeds this cache from
+//    applyBatchResults() and from nothing else, so a half-written node or a
+//    refused write never enters persistent storage. A self-identical answer
+//    (Nvidia -> Nvidia) IS stored, as original -> original: the API answered
+//    normally and that is the correct translation, so the next visit must not
+//    re-send it. The one thing kept out is a sentence-like copy that has not
+//    had its echo retry yet - caching it would answer the retry from cache.
 //
 // 3. Trim order is earned, not chronological. Every lookup hit records a reuse
 //    on its entry, and maintain() ages an entry 1/(1+reuses) as fast, so the

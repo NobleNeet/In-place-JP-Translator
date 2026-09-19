@@ -34,6 +34,13 @@
     // segments are not written off: they are re-sent as a few small requests.
     RECOVERY: { maxSegmentsPerRequest: 6, maxRequests: 12 },
 
+    // A translation identical to the source is not a failure: Nvidia ->
+    // Nvidia is the correct answer. Only a copy long enough to be a real
+    // sentence (minWords English words, with word spacing) is the kind of
+    // thing a general LLM returns when it ignored a long batched prompt, so
+    // only that gets the one echo retry (content.js: shouldRetryIdentical).
+    ECHO_RETRY: { minWords: 5 },
+
     DEFAULT_PROFILE: 'evo-x2-plamo2',
     DEFAULT_MODE: 'single',
     DEFAULT_MAX_CONCURRENT: 2,

@@ -1047,13 +1047,21 @@ async function main() {
   console.log('== content diagnostics API ==');
   const api = sandbox.window.__plamo;
   ok('window.__plamo exposed', typeof api === 'object' && api !== null);
-  ['getState', 'getPending', 'getLogs', 'dumpLogs', 'backgroundLogs', 'pingBackground', 'translatePage', 'restoreAll', 'getCache', 'getSettings', 'getBatchPlan', 'getBatcherCaps', 'getChannel', 'getRecoveryCaps', 'getApiPlan', 'getSegmentStats', 'getDeferred', 'revealNow', 'forgetDeferred']
+  ['getState', 'getPending', 'getLogs', 'dumpLogs', 'backgroundLogs', 'pingBackground', 'translatePage', 'restoreAll', 'getCache', 'getSettings', 'getBatchPlan', 'getBatcherCaps', 'getChannel', 'getRecoveryCaps', 'getApiPlan', 'getSegmentStats', 'getDeferred', 'revealNow', 'forgetDeferred', 'shouldRetryIdentical']
     .forEach(fn => ok('__plamo.' + fn + '()', typeof api[fn] === 'function'));
   ok('getDeferred() says what a run held back and what is still waiting',
     api.getDeferred().waiting === 0 && Array.isArray(api.getDeferred().sample), api.getDeferred());
   ok('getChannel names the durable channel', api.getChannel().name === ns.constants.PORT_TRANSLATE &&
     api.getChannel().kind === 'none', JSON.stringify(api.getChannel()));
   ok('the recovery chunk size is a constant', api.getRecoveryCaps().maxSegmentsPerRequest === ns.constants.RECOVERY.maxSegmentsPerRequest);
+  // The echo-retry threshold: a short label / product name / acronym is a
+  // correct no-op and must never be retried; only a real sentence is.
+  ['Nvidia', 'CUDA', 'GitHub', 'TOPICS', 'GeForce RTX 5090', 'Microsoft Windows', 'Artificial Intelligence']
+    .forEach((t) => ok('shouldRetryIdentical never retries: ' + t, api.shouldRetryIdentical(t) === false, t));
+  ok('shouldRetryIdentical retries a real sentence',
+    api.shouldRetryIdentical('The company announced its new graphics cards on Monday.') === true);
+  ok('a single long token is not a sentence', api.shouldRetryIdentical('Supercalifragilisticexpialidocious') === false);
+  ok('the threshold is a constant', ns.constants.ECHO_RETRY.minWords === 5, ns.constants.ECHO_RETRY);
   await chromeFake.storage.local.set({ plamo: { profileName: 'local-plamo2', maxConcurrent: 3, batch: { maxSegmentsPerBatch: 8, firstBatchMaxSegments: 4 }, request: { strategy: 'single' } } });
   await api.translatePage(); // reads settings, then rebuilds the packer from them
   ok('saved segment caps reach the packer in use', api.getBatcherCaps().maxSegmentsPerBatch === 8 &&
@@ -1061,7 +1069,8 @@ async function main() {
   ok('packing plan reports what a run would do', api.getBatchPlan().strategy === 'single' &&
     api.getBatchPlan().caps.maxSegmentsPerBatch === 8 && api.getBatchPlan().requests === 0, api.getBatchPlan());
   const stateNow = api.getState();
-  ok('getState exposes counters', typeof stateNow.translated === 'number' && typeof stateNow.cache.entries === 'number');
+  ok('getState exposes counters', typeof stateNow.translated === 'number' && typeof stateNow.unchanged === 'number' &&
+    typeof stateNow.cache.entries === 'number');
   await chromeFake.storage.local.set({ plamo: { profileName: 'local-plamo2', maxConcurrent: 2,
     apis: { 'evo-x2-plamo2': { enabled: true, concurrency: 2 }, 'local-plamo2': { enabled: true, concurrency: 4 } },
     batch: { maxSegmentsPerBatch: 8, firstBatchMaxSegments: 4 }, request: { strategy: 'single' } } });

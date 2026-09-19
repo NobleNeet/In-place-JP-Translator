@@ -15,11 +15,15 @@
 // has room, bounded by its OWN concurrency) -> write each finished translation
 // into its own text node (node.nodeValue only) as soon as its batch arrives.
 // Because an element's children are never replaced, links/forms/images survive
-// and the layout holds. A translation that is just a copy of the English
-// ('identical') is not a success: it is never cached, and at the end of the run
-// every copied segment gets one more small request with an explicit do-not-copy
-// instruction (retryEchoSegments). MSG_RESTORE (or __plamo.restoreAll()) puts
-// the original values back.
+// and the layout holds. Every segment ends the run in one of three columns:
+// 'translated' (an answer that differs from the source and landed in the DOM),
+// 'unchanged' (the API answered normally and the answer IS the source - the
+// correct result for Nvidia or CUDA, recorded in the cache so it is never
+// re-sent), and 'failed' (API error, empty answer, alignment failure). A
+// sentence-like copy from a general LLM is the one unchanged case worth asking
+// about again, so it gets ONE retry in the ordinary request form at the end of
+// the run (retryEchoSegments); still identical after that, it is unchanged.
+// MSG_RESTORE (or __plamo.restoreAll()) puts the original values back.
 // Text the user could not see when the page was scanned is not sent at all: it
 // is remembered and translated on its own as soon as the page displays it (see
 // the reveal watch below, and content/priority.js for what counts as hidden).
@@ -287,20 +291,22 @@
   // --- per-run accounting ---------------------------------------------------
   function emptySummary() {
     return {
-      total: 0, translated: 0, failed: 0, cacheHits: 0, applied: 0, skipped: 0,
+      total: 0, translated: 0, unchanged: 0, failed: 0, cacheHits: 0, applied: 0, skipped: 0,
       requests: 0, batches: 0, units: 0, persisted: 0, persistentHits: 0,
       elapsedMs: 0, firstTranslatedLatencyMs: 0, firstViewportLatencyMs: 0,
       errorCounts: {}, skipCounts: {}, errors: []
     };
   }
 
-  // echoSegments: segments the model answered with a copy of the English
-  // (renderer reason 'identical'). They get ONE more chance after the run
-  // (retryEchoSegments); retryRound says "we are in that second chance now", so
-  // a second copy is recorded as a fact instead of triggering another retry.
+  // The three outcome columns of a run: translated (an answer that differs and
+  // landed), unchanged (the API answered and the answer is the source itself),
+  // failed (API error / empty / alignment). echoSegments holds the sentence-like
+  // copies waiting for their one retry (retryEchoSegments); retryRound says "we
+  // are in that retry now", so a copy that survives it is recorded as unchanged
+  // instead of re-entering the queue.
   function newStats() {
     return {
-      translated: 0, failed: 0, cacheHits: 0, applied: 0, skipped: 0, requests: 0,
+      translated: 0, unchanged: 0, failed: 0, cacheHits: 0, applied: 0, skipped: 0, requests: 0,
       errorCounts: {}, skipCounts: {}, errors: [],
       echoSegments: [], retryRound: false, echoRetried: 0
     };
@@ -314,6 +320,7 @@
   function syncLive(stats) {
     if (!live || !stats) return;
     live.translated = stats.translated;
+    live.unchanged = stats.unchanged;
     live.failed = stats.failed;
     live.cacheHits = stats.cacheHits;
     live.applied = stats.applied;
@@ -332,7 +339,8 @@
   }
 
   // A translated segment that could not be written back (node gone, page
-  // re-rendered it, translation identical). Counted apart from API errors.
+  // re-rendered it). Counted apart from API errors. An 'identical' answer is
+  // NOT a skip: it is its own 'unchanged' column (see applyBatchResults).
   function countSkip(stats, reason) {
     stats.skipCounts[reason] = (stats.skipCounts[reason] || 0) + 1;
     if (live) live.skipCounts = stats.skipCounts;
@@ -342,15 +350,32 @@
     if (stats.errors.length < 12) stats.errors.push(String(message).slice(0, 200));
   }
 
+  // Is an identical answer worth asking about again? A copy of a short label,
+  // product name or acronym (Nvidia, CUDA, GeForce RTX 5090, TOPICS) is the
+  // correct translation of that text, not a failure. Only a copy with enough
+  // English words to be a real sentence is the kind of thing a general LLM
+  // produces when it ignores a long batched prompt - that, and only that, is
+  // worth one retry (retryEchoSegments).
+  function shouldRetryIdentical(text) {
+    text = String(text || '').trim();
+    var words = text.match(/[A-Za-z]+(?:['’-][A-Za-z]+)*/g) || [];
+    var minWords = (C.ECHO_RETRY && C.ECHO_RETRY.minWords) || 5;
+    if (words.length < minWords) return false;
+    // A single long token is not a sentence either; require real word spacing.
+    return /\s/.test(text);
+  }
+
   // Writes a batch's translations into the DOM. The target text node always
   // comes from segmentsById (page side), because a DOM node cannot cross the
   // message boundary — that is why segments are sent as ids only. Each
   // translation lands in one Text node (node.nodeValue), never in an element,
-  // so the page structure survives. Only a translation that ACTUALLY landed
-  // goes into the session cache: caching before the write meant an 'identical'
-  // answer (the model copying the English) was cached as a success, so every
-  // later run served the copy from cache and the text was never translated
-  // again. An identical answer is instead queued for one honest retry.
+  // so the page structure survives. Every answer lands in one of three
+  // columns: translated (differs and landed, cached as usual), unchanged (the
+  // API answered and the answer IS the source - recorded in both cache layers
+  // as original -> original so no later run re-sends it), and failed (API
+  // error / empty, counted by handleBatchResponse). The one unchanged case
+  // worth a second look is a sentence-like copy from the API: it is queued
+  // for one retry in the ordinary request form instead of being settled now.
   function applyBatchResults(btag, res, segmentsById, stats) {
     var ids = Object.keys((res && res.results) || {});
     var applied = 0;
@@ -391,15 +416,33 @@
           if (persist && persist.enabled()) persist.remember(textKey, r.translatedText);
         }
       }
+      else if (out.reason === 'identical') {
+        // The API answered normally and the answer is the source itself. That
+        // is neither a failure nor a skip: it is 'unchanged'. The background
+        // counted it as translated, so take it back out of that column.
+        stats.translated = Math.max(0, stats.translated - 1);
+        if (!r.cached && !stats.retryRound && shouldRetryIdentical(textKey)) {
+          // A sentence-like copy straight from the API: queue it for its one
+          // retry. Deliberately NOT cached yet - the retry has to reach the
+          // API, and a cached copy would answer the retry from the cache.
+          stats.echoSegments.push(seg);
+        } else {
+          // A short label / product name / acronym, or a copy that already
+          // survived its retry: a processed no-op. Record original ->
+          // original in both cache layers so no later run sends it out
+          // again. The DOM already holds this exact text, so nothing is
+          // written there.
+          stats.unchanged++;
+          if (typeof textKey === 'string' && textKey) {
+            cache.set(textKey, textKey);
+            var persistSame = persistent();
+            if (persistSame && persistSame.enabled()) persistSame.remember(textKey, textKey);
+          }
+        }
+      }
       else {
         stats.skipped++;
         countSkip(stats, out.reason || 'refused');
-        // The background counted this as translated; a copy of the English is
-        // not a translation, so take it back out of the count.
-        if (out.reason === 'identical') {
-          stats.translated = Math.max(0, stats.translated - 1);
-          if (!stats.retryRound) stats.echoSegments.push(seg);
-        }
         if (problems.length < 4) {
           problems.push('seg#' + id + ' not written [' + out.reason + '] ' + (seg.source.path || seg.source.parentTag || ''));
         }
@@ -533,27 +576,25 @@
     });
   }
 
-  var ECHO_RETRY_PROMPT =
-    'You are translating into Japanese. The previous attempt returned some of these lines ' +
-    'UNCHANGED: copying the English is a failure, not an answer. Rewrite EVERY line below ' +
-    'in natural Japanese; every answer line must contain Japanese characters.';
-
-  // The second chance for 'identical' answers: the model looked at the English
-  // and wrote it straight back. Sometimes that is the text genuinely not being
-  // worth translating (an .sr-only label - those are now filtered at extraction,
-  // see content/extractor.js), but for real prose a batched prompt can be what
-  // caused it: with 24 lines of mixed text a translation model loses the plot
-  // and copies a line. This one round goes out as small requests carrying an
-  // explicit instruction (the profiles send no instruction by default, which is
-  // right for a translation model and wrong for a model that just echoed).
-  // Still identical after this, it is recorded as a fact: no third round, and
-  // nothing is cached either way (the cache only ever holds landed text).
+  // The one retry for a sentence-like copy: the model looked at a real English
+  // sentence and wrote it straight back. Short labels, product names and
+  // acronyms never reach this round - shouldRetryIdentical() settled them as
+  // 'unchanged' already, because a copy of "Nvidia" is the right answer. What
+  // is left is the case a general LLM produces when a long mixed batch makes it
+  // lose the plot and echo a line. The retry deliberately changes NOTHING about
+  // the request form: same system prompt, same batchSystemPrompt, same strategy
+  // as an ordinary batch, just the echoed segments cut out into a small request
+  // of their own. A forced "do not copy" instruction is exactly what a
+  // translation-specialised model (PLaMo 2 Translate, CAT-Translate) echoes
+  // back as the translation, writing the prompt's own Japanese onto the page.
+  // Still identical after this one round, the segment is 'unchanged': no third
+  // round, and the no-op is cached so the next run does not re-send it.
   function retryEchoSegments(tag, dispatcher, segmentsById, stats, latencies) {
     var echoes = stats.echoSegments;
     if (!echoes.length) return Promise.resolve();
     stats.retryRound = true; // set NOW: an answer arriving during this round must not re-enter the queue
     if (abortRequested) {
-      log.warn(tag + ' ' + echoes.length + ' identical segment(s) are not retried: Stop is in effect');
+      log.warn(tag + ' ' + echoes.length + ' sentence-like identical segment(s) are not retried: Stop is in effect');
       return Promise.resolve();
     }
     var per = (C.RECOVERY && C.RECOVERY.maxSegmentsPerRequest) || 6;
@@ -563,14 +604,14 @@
     // echoes everything must not turn a run into an endless second run.
     if (chunks.length > maxReq) {
       log.warn(tag + ' echo retry limited to ' + maxReq + ' request(s); ' +
-        (echoes.length - maxReq * per) + ' identical segment(s) are not retried');
+        (echoes.length - maxReq * per) + ' sentence-like identical segment(s) are not retried');
       chunks = chunks.slice(0, maxReq);
     }
     var retried = 0;
     chunks.forEach(function (ch) { retried += ch.segments.length; });
     stats.echoRetried = retried;
-    log.warn(tag + ' ' + echoes.length + ' segment(s) came back as a copy of the English; retrying ' +
-      retried + ' of them as ' + chunks.length + ' small request(s) with an explicit do-not-copy instruction');
+    log.warn(tag + ' ' + retried + ' sentence-like identical segment(s) retried once as ' +
+      chunks.length + ' small request(s) in the ordinary translation form');
     var chain = Promise.resolve();
     chunks.forEach(function (chunkBatch, ci) {
       chain = chain.then(function () {
@@ -591,14 +632,13 @@
           profileName: api.name,
           concurrency: api.concurrency,
           model: (api && api.model) || undefined,
-          // The one thing this round changes: the batched system prompt. It
-          // rides on the dedicated field so it wins over whatever the API's
-          // own saved prompt is (including an empty one) — the whole point of
-          // the round is the explicit do-not-copy instruction.
-          systemPrompt: ECHO_RETRY_PROMPT,
+          // Normal form, exactly like recoverBatch(): the server's own system
+          // prompt and the run's own request settings, nothing forced. The
+          // retry's whole point is that a smaller request of the SAME shape is
+          // what gets a general LLM to actually translate the line.
+          systemPrompt: (api && api.systemPrompt),
           strategy: (settings.request && settings.request.strategy) || undefined,
-          // The one thing this round changes: the batched system prompt.
-          request: Object.assign({}, settings.request || {}, { batchSystemPrompt: ECHO_RETRY_PROMPT }),
+          request: settings.request || undefined,
           cache: messaging.toWireCache(cache, chunkBatch.segments)
         };
         live.sent++;
@@ -632,7 +672,7 @@
     live = {
       runId: runId, phase: 'loading-settings', segments: 0, batches: 0, sent: 0, inFlight: 0,
       units: 0, requests: 0,
-      translated: 0, failed: 0, cacheHits: 0, applied: 0, skipped: 0, errorCounts: {},
+      translated: 0, unchanged: 0, failed: 0, cacheHits: 0, applied: 0, skipped: 0, errorCounts: {},
       skipCounts: {}, startedAt: Date.now()
     };
     log.info(tag + ' translatePage start (profile=' + (settings && settings.profileName) + ' cache=' + cache.map.size + ')');
@@ -826,6 +866,7 @@
             var summary = {
               total: segments.length,
               translated: stats.translated,
+              unchanged: stats.unchanged,
               failed: stats.failed,
               cacheHits: stats.cacheHits,
               applied: stats.applied,
@@ -854,6 +895,7 @@
             live.phase = 'idle';
             lastRun = summary;
             var endLine = tag + ' done total=' + summary.total + ' translated=' + summary.translated +
+              ' unchanged=' + summary.unchanged +
               ' applied=' + summary.applied + ' failed=' + summary.failed + ' skipped=' + summary.skipped +
               ' cacheHits=' + summary.cacheHits + ' requests=' + summary.requests +
               ' (' + summary.batches + ' request(s) for ' + summary.total + ' segment(s))' +
@@ -868,10 +910,11 @@
             }
             if (Object.keys(stats.skipCounts).length) {
               log.warn(tag + ' translated but not written ' + JSON.stringify(stats.skipCounts) +
-                ' :: "changed-after-extract" means the page re-rendered that node ' +
-                '(SPA); "identical" means the model copied the English, retried once ' +
-                '(see the echo#N lines); see __plamo.getApplied() for what did land and ' +
-                '__plamo.getUntranslated() for what is still in English');
+                ' :: "changed-after-extract" means the page re-rendered that node '
+                + '(SPA); see __plamo.getApplied() for what did land and '
+                + '__plamo.getUntranslated() for what is still in English. A copy of the '
+                + 'English is NOT a skip: it is the "unchanged=" column of the line above '
+                + '(sentence-like copies get one retry, see the echo#N lines).');
             }
             uiEvent('run-end');
             return summary;
@@ -1010,6 +1053,9 @@
       sent: l.sent || 0,
       inFlight: l.inFlight || 0,
       translated: l.translated || 0,
+      // The API answered and the answer was the source itself (Nvidia ->
+      // Nvidia). Its own column: never mixed into failed or skipped.
+      unchanged: l.unchanged || 0,
       failed: l.failed || 0,
       cacheHits: l.cacheHits || 0,
       applied: l.applied || 0,
@@ -1437,6 +1483,10 @@
         : { kind: 'none', name: C.PORT_TRANSLATE, requests: 0, pending: [] };
     },
     getRecoveryCaps: function () { return Object.assign({}, C.RECOVERY); },
+    // Is an identical answer sentence-like enough for the one echo retry?
+    // Exposed so the threshold itself (Nvidia no, a real sentence yes) can be
+    // checked without driving a whole run.
+    shouldRetryIdentical: shouldRetryIdentical,
     // The APIs a run would send through right now (settings.apis). `schedule` is
     // the share each server tends to get (one entry per slot it can fill), NOT an
     // assignment: which server a batch lands on is decided when a slot frees, in

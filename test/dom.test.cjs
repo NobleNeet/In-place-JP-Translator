@@ -682,6 +682,12 @@ const stored = {};
 // at the end turns it on again through putSettings.
 stored.plamo = { cache: { enabled: false } };
 const bg = { requests: 0, sent: [] }; // the fake worker: what it was asked to translate
+// What the fake worker "translates" a forced do-not-copy instruction into.
+// A translation-specialised model (PLaMo 2 Translate, CAT-Translate) fed the
+// old ECHO_RETRY_PROMPT answers with the prompt's own Japanese, which then
+// lands on the page. If a forced instruction ever returns to the send path,
+// the echo tests below catch this string where it must never appear.
+const FORCED_PROMPT_JP = '（前回の試行は変更なしで返されました）';
 // Per-server instrumentation for the multi-API run below: bg.latency answers a
 // request from a given profile after N ms, and the counters say what each server
 // was asked and how many requests it had in flight at once.
@@ -696,10 +702,20 @@ function answerTranslate(msg, respond) {
   const wireCache = (msg && msg.cache) || {};
   const results = {};
   let cachedAnswers = 0;
-  // An echo-retry request identifies itself by the explicit instruction the
-  // page adds (content.js: ECHO_RETRY_PROMPT as request.batchSystemPrompt).
-  const strict = !!(msg.request && msg.request.batchSystemPrompt);
-  (bg.prompts = bg.prompts || []).push(strict ? 'strict' : 'plain');
+  // Record the prompt shape of every request so a test can prove the echo
+  // retry sends the ORDINARY form: no forced do-not-copy instruction on
+  // systemPrompt or request.batchSystemPrompt. A translation-specialised model
+  // (PLaMo 2 Translate, CAT-Translate) translates such a prompt and writes its
+  // Japanese onto the page, which is the bug this round must never reintroduce.
+  (bg.prompts = bg.prompts || []).push({
+    system: msg.systemPrompt == null ? null : String(msg.systemPrompt),
+    batchSystem: (msg.request && msg.request.batchSystemPrompt) || ''
+  });
+  // Simulate the specialised-model failure mode: a request carrying a forced
+  // do-not-copy instruction gets the instruction's own Japanese back as every
+  // segment's translation, instead of a translation of the segment.
+  const forced = /UNCHANGED|copying the English|You are translating/i
+    .test((msg.systemPrompt || '') + ' ' + ((msg.request && msg.request.batchSystemPrompt) || ''));
   wire.forEach((s) => {
     if (typeof wireCache[s.text] === 'string') {
       cachedAnswers++;
@@ -709,9 +725,13 @@ function answerTranslate(msg, respond) {
     bg.requests++;
     bg.sent.push(s.text);
     // bg.echo lists the texts this fake server answers with a copy of the
-    // English (the model echoing); echoHard keeps echoing even when asked.
+    // English (the model echoing). The first attempt always echoes; a second
+    // attempt echoes only when echoHard says this server will never budge.
+    const tries = (bg.attempts = bg.attempts || {});
+    const n = (tries[s.text] = (tries[s.text] || 0) + 1);
     let out = 'ヒミツノモジ';
-    if (bg.echo && bg.echo.has(s.text) && (!strict || bg.echoHard)) out = s.text;
+    if (forced) out = FORCED_PROMPT_JP;
+    else if (bg.echo && bg.echo.has(s.text) && (n === 1 || bg.echoHard)) out = s.text;
     // A translation with no Latin letters in it, so the page's own "is this
     // English?" rule refuses to collect it a second time.
     results[s.id] = { text: s.text, translatedText: out };
@@ -724,7 +744,10 @@ function answerTranslate(msg, respond) {
   setTimeout(() => {
     if (bg.inflight[prof] > 0) bg.inflight[prof]--;
     respond({
-      requestId: msg.id, status: 'success', results, translated: wire.length - cachedAnswers, failed: 0,
+      // Like the real background, every non-error result counts as translated,
+      // cached answers included (cacheHits reports them separately). The page
+      // then takes the identical ones back out of that column itself.
+      requestId: msg.id, status: 'success', results, translated: wire.length, failed: 0,
       cacheHits: cachedAnswers, requests: 1, segments: wire.length, units: (msg.batch && msg.batch.units) || 1,
       elapsedMs: 1, profile: prof, endpoint: 'http://127.0.0.1:9/v1', strategy: 'multi'
     });
@@ -897,45 +920,119 @@ const putSettings = (patch) => sandbox.chrome.storage.local.set(patch);
   ok('the watcher is quiet once nothing is waiting', api.getDeferred().watching === false, api.getDeferred());
 
   // --- the model copying the English ------------------------------------------
-  // An `identical` answer used to be cached as a success and never asked about
-  // again: the text stayed English forever. Now it gets exactly ONE more
-  // chance, as a small request carrying an explicit do-not-copy instruction.
-  console.log('== echo retry: a copied answer gets one honest second chance ==');
+  // A copy of the source is no longer a failure. It is its own outcome,
+  // 'unchanged', and only a copy long enough to be a real sentence is worth
+  // asking about again - and that one retry goes out in the ORDINARY request
+  // form, because a forced "do not copy" instruction is exactly what a
+  // translation-specialised model translates and writes onto the page.
+  console.log('== unchanged: a copy of the source is its own outcome, not a failure ==');
+  const noRetryBox = E('div', { class: 'no-retry-zone' },
+    E('p', {}, 'Nvidia'), E('p', {}, 'CUDA'), E('p', {}, 'GitHub'),
+    E('p', {}, 'TOPICS'), E('p', {}, 'GeForce RTX 5090'),
+    E('p', {}, 'Microsoft Windows'), E('p', {}, 'Artificial Intelligence'));
+  mainEl.appendChild(noRetryBox);
+  const noRetryTexts = ['Nvidia', 'CUDA', 'GitHub', 'TOPICS', 'GeForce RTX 5090', 'Microsoft Windows', 'Artificial Intelligence'];
+  noRetryTexts.forEach((t) => ok('a short label/product name is never a retry candidate: ' + t,
+    api.shouldRetryIdentical(t) === false, t));
+  ok('a real sentence IS a retry candidate',
+    api.shouldRetryIdentical('The company announced its new graphics cards on Monday.') === true);
+
+  bg.attempts = {}; bg.prompts = [];
+  bg.echo = new Set(noRetryTexts);
+  bg.echoHard = true; // even if a retry somehow happened, it would still echo
+  const runNR = await api.translatePage(noRetryBox);
+  ok('every short label came back unchanged', runNR.unchanged === 7, runNR.unchanged);
+  ok('none of them counted as translated', runNR.translated === 0, runNR.translated);
+  ok('none of them counted as failed', runNR.failed === 0, runNR.failed);
+  ok('none of them counted as skipped', runNR.skipped === 0 && !runNR.skipCounts.identical,
+    JSON.stringify(runNR.skipCounts));
+  // The first run sends each label once (that is the answer that comes back
+  // unchanged); the point is none of them go out a SECOND time for a retry.
+  const labelSends = noRetryTexts.reduce((n, t) => n + bg.sent.filter((s) => s === t).length, 0);
+  ok('not one of them was re-sent for an echo retry', runNR.echoRetried === 0 && labelSends === 7,
+    [runNR.echoRetried, labelSends]);
+  ok('getState() reports the unchanged column too', api.getState().unchanged === 7, api.getState().unchanged);
+
+  // The no-op is recorded as processed: a second run must not send any of them.
+  const sentBeforeNR2 = bg.sent.length;
+  const runNR2 = await api.translatePage(noRetryBox);
+  ok('the next run sends none of the unchanged texts again',
+    bg.sent.length === sentBeforeNR2, bg.sent.length - sentBeforeNR2);
+  ok('and they are unchanged again, without a request',
+    runNR2.unchanged === 7 && runNR2.cacheHits >= 7 && runNR2.echoRetried === 0,
+    [runNR2.unchanged, runNR2.cacheHits, runNR2.echoRetried]);
+
+  // --- a sentence-like copy gets exactly one ordinary retry -------------------
+  console.log('== echo retry: a sentence-like copy gets one retry in the ordinary form ==');
+  const SENTENCE = 'The company announced its new graphics cards on Monday.';
   const echoBox = E('div', { class: 'echo-zone' },
-    E('p', {}, 'Copy me not please'), E('p', {}, 'Echo me you say'));
+    E('p', {}, 'Copy me not please brother'), E('p', {}, SENTENCE));
   mainEl.appendChild(echoBox);
   const echoNodes = echoBox.querySelectorAll('p').map((p) => p.firstChild);
-  bg.echo = new Set(['Copy me not please', 'Echo me you say']);
-  bg.echoHard = false;
+  bg.attempts = {}; bg.prompts = [];
+  bg.echo = new Set(['Copy me not please brother', SENTENCE]);
+  bg.echoHard = false; // the second attempt translates
   const runA = await api.translatePage(echoBox);
-  ok('both paragraphs copied on the first try', runA.skipCounts.identical === 2, runA.skipCounts);
-  ok('the strict retry followed the plain request',
-    bg.prompts.slice(-2).join(',') === 'plain,strict', bg.prompts.slice(-3));
+  ok('both sentences were retried once', runA.echoRetried === 2, runA.echoRetried);
+  ok('each was sent exactly twice (batch + retry)',
+    bg.attempts[SENTENCE] === 2 && bg.attempts['Copy me not please brother'] === 2,
+    JSON.stringify(bg.attempts));
   ok('the retry translated and wrote both', echoNodes.every((n) => jp(n.nodeValue)) && runA.applied === 2,
     echoNodes.map((n) => n.nodeValue));
-  ok('the retry round is counted in the summary', runA.echoRetried === 2, runA.echoRetried);
   ok('a translated-after-retry segment counts as translated once, not twice',
     runA.translated === 2, runA.translated);
+  ok('nothing is left unchanged once the retry landed', runA.unchanged === 0, runA.unchanged);
+  ok('the retry is not a failure', runA.failed === 0, runA.failed);
+  // The whole point of the ordinary form: no forced instruction anywhere.
+  const forcedSeen = bg.prompts.filter((p) => /UNCHANGED|copying the English|You are translating/i
+    .test((p.system || '') + ' ' + (p.batchSystem || '')));
+  ok('no request carried a forced do-not-copy system prompt', forcedSeen.length === 0,
+    JSON.stringify(forcedSeen));
+  ok('no request carried a forced batchSystemPrompt',
+    bg.prompts.every((p) => !/UNCHANGED|copying the English|You are translating/i.test(p.batchSystem)),
+    JSON.stringify(bg.prompts.map((p) => p.batchSystem)));
+  ok('the prompt text never reached the page',
+    !echoBox.textContent.includes('You are translating') &&
+    !echoBox.textContent.includes(FORCED_PROMPT_JP) &&
+    !documentMock.textContent.includes(FORCED_PROMPT_JP), echoBox.textContent);
 
-  // A server that will not translate this one no matter what: it stays English,
-  // is tried exactly twice, and above all the copy must never enter the session
-  // cache, or every later run serves the English as a translation.
-  const stubborn = E('p', {}, 'Stubborn wording here');
+  // A server that will not budge: it stays English, is tried exactly twice, and
+  // settles as 'unchanged' - recorded as processed so no later run re-sends it.
+  // The persistent cache is on for this run so the no-op's storage entry can be
+  // checked too.
+  await putSettings({ plamo: { priority: { deferHidden: true }, cache: { enabled: true } } });
+  const stubborn = E('p', {}, 'Stubborn wording here nobody can translate');
   echoBox.appendChild(stubborn);
-  const entriesBefore = api.getCache().entries;
-  bg.echo = new Set(['Stubborn wording here']);
+  const stubbornNode = stubborn.firstChild;
+  const entriesBeforeB = api.getCache().entries;
+  bg.attempts = {}; bg.prompts = [];
+  bg.echo = new Set(['Stubborn wording here nobody can translate']);
   bg.echoHard = true;
   const runB = await api.translatePage(echoBox);
-  const stubbornNode = stubborn.firstChild;
   ok('a stubborn copy stays in English', !jp(stubbornNode.nodeValue) &&
-    stubbornNode.nodeValue === 'Stubborn wording here', stubbornNode.nodeValue);
-  ok('it was tried exactly twice', bg.sent.filter((t) => t === 'Stubborn wording here').length === 2,
-    bg.sent.filter((t) => t === 'Stubborn wording here').length);
-  ok('a copy never enters the session cache', api.getCache().entries === entriesBefore,
-    [entriesBefore, api.getCache().entries]);
-  ok('a copy does not count as translated', runB.translated === 0, runB.translated);
+    stubbornNode.nodeValue === 'Stubborn wording here nobody can translate', stubbornNode.nodeValue);
+  ok('it was tried exactly twice, never a third time',
+    bg.attempts['Stubborn wording here nobody can translate'] === 2,
+    bg.attempts['Stubborn wording here nobody can translate']);
+  ok('a stubborn copy is unchanged, not failed and not skipped',
+    runB.unchanged === 1 && runB.failed === 0 && !runB.skipCounts.identical,
+    [runB.unchanged, runB.failed, JSON.stringify(runB.skipCounts)]);
+  ok('a stubborn copy does not count as translated', runB.translated === 0, runB.translated);
+  ok('the retry round is reported in the summary', runB.echoRetried === 1, runB.echoRetried);
+  ok('the unchanged no-op is recorded in the session cache as original -> original',
+    api.getCache().entries === entriesBeforeB + 1, [entriesBeforeB, api.getCache().entries]);
+  const stubbornStored = stored[ns.persistentCache.entryKey('Stubborn wording here nobody can translate')];
+  ok('and in the cache that outlives the page, as original -> original',
+    !!stubbornStored && stubbornStored.t === stubbornStored.s, stubbornStored);
+  const sentBeforeStubborn = bg.sent.length;
+  const runB2 = await api.translatePage(echoBox);
+  ok('a later run does not re-send the unchanged no-op',
+    bg.sent.length === sentBeforeStubborn, bg.sent.length - sentBeforeStubborn);
+  ok('and it settles unchanged again', runB2.unchanged >= 1 && runB2.failed === 0 && runB2.echoRetried === 0,
+    [runB2.unchanged, runB2.failed, runB2.echoRetried]);
   bg.echo = null;
   bg.echoHard = false;
+  await api.clearPersistentCache(); // start the persistent-cache section from an empty store
 
   // --- the cache that outlives the page ---------------------------------------
   // The session cache dies with the page; translation/persistent.js keeps the
@@ -1027,9 +1124,6 @@ const putSettings = (patch) => sandbox.chrome.storage.local.set(patch);
   ok('sixty days old but in daily use, an entry outlives one read once ten days ago',
     Object.keys(pcGone.hits).length === 0 && Object.keys(pcKept.hits).length === 2,
     [Object.keys(pcGone.hits), Object.keys(pcKept.hits)]);
-  const stubbornKeys = pcKeys().filter((k) => stored[k].s === 'Stubborn wording here');
-  ok('a copied answer never enters the cache that outlives the page',
-    stubbornKeys.length === 0, stubbornKeys);
   ns.persistentCache.configure({});
   const pcCleared = await api.clearPersistentCache();
   ok('__plamo.clearPersistentCache() empties the store',
