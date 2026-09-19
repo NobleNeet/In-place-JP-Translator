@@ -13,6 +13,7 @@
   var MSG_TRANSLATE_PAGE = ns.constants.MSG_TRANSLATE_PAGE;
   var MSG_RESTORE = ns.constants.MSG_RESTORE;
   var MSG_STOP = ns.constants.MSG_STOP;
+  var MSG_CLEAR_CACHE = ns.constants.MSG_CLEAR_CACHE;
 
   var $ = function (id) { return document.getElementById(id); };
   var settings = {};
@@ -124,6 +125,32 @@
     status = s;
     if (c) counts = c;
     render();
+  }
+
+  // --- Clear Cache (testing) ------------------------------------------------
+  // Wipes every cached translation so the next run re-translates from zero.
+  // The persistent store lives in chrome.storage.local, shared with every tab,
+  // so the popup removes it directly (under CACHE_KEY_PREFIX) instead of
+  // relying on a content script being reachable; the active tab's session
+  // cache then gets a MSG_CLEAR_CACHE. A tab with no content script is not
+  // an error here - the layer that survives the page is already gone, and the
+  // session cache dies with the page anyway.
+  function clearPersistentStore() {
+    return new Promise(function (resolve, reject) {
+      chrome.storage.local.get(null, function (raw) {
+        if (chrome.runtime.lastError) {
+          reject(new Error(chrome.runtime.lastError.message));
+          return;
+        }
+        var prefix = ns.constants.CACHE_KEY_PREFIX;
+        var keys = Object.keys(raw || {}).filter(function (k) { return k.indexOf(prefix) === 0; });
+        if (!keys.length) { resolve(0); return; }
+        chrome.storage.local.remove(keys, function () {
+          if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+          else resolve(keys.length);
+        });
+      });
+    });
   }
 
   // One block per API profile (api/profiles.js): a tick box for "use this
@@ -510,6 +537,36 @@
         }).catch(function (err) {
           lastError = String((err && err.message) || err) + messaging.hintFor(err && err.message);
           renderStatus('page not ready (reload it)');
+        });
+      });
+    }
+
+    // Testing: discard every cached translation (persistent store + the active
+    // tab's session cache). Does not touch the page - text already translated
+    // stays; only the caches go, so the next "Translate Page" re-translates.
+    var clearCacheBtn = $('clearCacheBtn');
+    if (clearCacheBtn) {
+      clearCacheBtn.addEventListener('click', function () {
+        lastError = null;
+        clearCacheBtn.disabled = true;
+        renderStatus('clearing cache');
+        clearPersistentStore().then(function (removed) {
+          return sendToTab({ type: MSG_CLEAR_CACHE, id: messaging.makeRequestId('popup') })
+            .then(function (res) { return { removed: removed, res: res }; })
+            .catch(function (err) { return { removed: removed, tabError: String((err && err.message) || err) }; });
+        }).then(function (out) {
+          clearCacheBtn.disabled = false;
+          var msg = 'cache cleared: ' + out.removed + ' stored entry(s) removed';
+          if (out.tabError) {
+            msg += ' (no content script in this tab; its session cache dies on reload)';
+          } else if (out.res && out.res.session != null) {
+            msg += ' + ' + out.res.session + ' session entr(y/ies)';
+          }
+          renderStatus(msg);
+        }).catch(function (err) {
+          clearCacheBtn.disabled = false;
+          lastError = String((err && err.message) || err) + messaging.hintFor(err && err.message);
+          renderStatus('error');
         });
       });
     }

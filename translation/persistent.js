@@ -27,7 +27,7 @@
   var C = ns.constants;
   var log = ns.logger.log;
 
-  var PREFIX = 'plamo-t-';
+  var PREFIX = C.CACHE_KEY_PREFIX;
   // Longer than any node the extractor produces (EXTRACT.maxTextLength is
   // 12000) with room to spare; caching a megabyte of one text node would cost
   // more in storage reads than the translation it would save.

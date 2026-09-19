@@ -32,6 +32,7 @@
   var MSG_TRANSLATE_PAGE = C.MSG_TRANSLATE_PAGE;
   var MSG_RESTORE = C.MSG_RESTORE;
   var MSG_STOP = C.MSG_STOP;
+  var MSG_CLEAR_CACHE = C.MSG_CLEAR_CACHE;
   var MSG_STATUS = C.MSG_STATUS;
   var MSG_TRANSLATE = C.MSG_TRANSLATE;
   var MSG_DIAGNOSTICS = C.MSG_DIAGNOSTICS;
@@ -918,6 +919,26 @@
     return Promise.resolve({ ok: true, aborted: true, waitingForDisplay: deferredNodes.length, state: getState() });
   }
 
+  // Clear every cache layer, for testing: this page's session cache and the
+  // store that outlives the page (translation/persistent.js). Deliberately
+  // does NOT touch the page itself - text nodes already translated stay as
+  // they are; only the caches go, so the next run re-translates everything.
+  function clearAllCaches() {
+    var sessionCleared = cache.map.size;
+    cache.clear();
+    var p = persistent();
+    if (!p) {
+      log.warn('clear cache: session cache cleared (' + sessionCleared +
+        ' entry(s)); persistent.js not loaded, nothing stored to clear');
+      return Promise.resolve({ ok: true, session: sessionCleared, persistent: 0 });
+    }
+    return p.clear().then(function (r) {
+      log.warn('clear cache: session ' + sessionCleared + ' entry(s), persistent ' + r.removed +
+        ' stored entry(s) removed, ' + r.pendingDropped + ' not-yet-written dropped');
+      return { ok: true, session: sessionCleared, persistent: r.removed, pendingDropped: r.pendingDropped };
+    });
+  }
+
   function handleMessage(request) {
     if (!request || !request.type) {
       log.warn('recv message with no type keys=' + Object.keys(request || {}).join('/'));
@@ -937,10 +958,13 @@
     if (request.type === MSG_STOP) {
       return stopRun();
     }
+    if (request.type === MSG_CLEAR_CACHE) {
+      return clearAllCaches();
+    }
     if (request.type === MSG_STATUS) {
       return Promise.resolve(getState());
     }
-    var handled = [MSG_TRANSLATE_PAGE, MSG_RESTORE, MSG_STOP, MSG_STATUS];
+    var handled = [MSG_TRANSLATE_PAGE, MSG_RESTORE, MSG_STOP, MSG_CLEAR_CACHE, MSG_STATUS];
     log.warn('unknown message type "' + request.type + '" | handled: ' + handled.join(', '));
     return Promise.resolve({ error: 'unknown message type: ' + request.type, handledTypes: handled, errorType: 'config' });
   }

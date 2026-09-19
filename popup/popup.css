@@ -48,6 +48,12 @@ button:disabled {
   cursor: not-allowed;
 }
 
+/* Clear Cache (testing): visually apart from the run controls */
+button.danger {
+  border-color: #d9534f;
+  color: #b00020;
+}
+
 select {
   width: 100%;
   padding: 4px;

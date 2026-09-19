@@ -7,6 +7,9 @@
     MSG_TRANSLATE_PAGE: 'plamo.translate-page',
     MSG_RESTORE: 'plamo.restore',
     MSG_STOP: 'plamo.stop',
+    // Testing: throw away every cached translation (session + persistent) so
+    // the next run re-translates everything from scratch.
+    MSG_CLEAR_CACHE: 'plamo.clear-cache',
     MSG_STATUS: 'plamo.status',
     MSG_TRANSLATE: 'plamo.translate',
     // Diagnostics helpers: let the page ask the background worker for its own
@@ -145,6 +148,9 @@
     },
 
     // --- the exact-match cache that outlives the page -------------------------
+    // Every persistent-cache entry is stored under this key prefix, so the
+    // popup can wipe the whole store without loading persistent.js.
+    CACHE_KEY_PREFIX: 'plamo-t-',
     // translation/persistent.js keeps finished translations in
     // chrome.storage.local, keyed by a hash of the source text; every entry
     // also stores its source, so a hit is a byte-for-byte identical text.

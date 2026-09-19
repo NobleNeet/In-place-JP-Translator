@@ -525,9 +525,16 @@ page opened in a second tab, then costs only the text nobody has ever translated
   everything the run applied is written back in a single `storage.set`.
 - **Capped and trimmed** (`CACHE_SETTINGS` in `shared/constants.js`): past
   `maxEntries`/`maxChars`, `maintain()` trims the store back to 90% of both
-  caps. The store lives under the `plamo-t-` key prefix;
+  caps. The store lives under the `plamo-t-` key prefix
+  (`CACHE_KEY_PREFIX` in `shared/constants.js`);
   `__plamo.clearPersistentCache()` empties it, and `settings.cache.enabled:
   false` turns the layer off.
+- **Clear Cache button (testing).** The popup's **Clear Cache** wipes both
+  layers at once: every `plamo-t-*` entry in `chrome.storage.local` (done
+  from the popup directly, so it works even when the active tab has no
+  content script) plus the active tab's session cache via
+  `plamo.clear-cache`. The page itself is not touched — text already
+  translated stays; the next "Translate Page" re-translates everything.
 - **Used often = kept longer.** Every entry carries how many lookups it has
   answered (`n`) and when it last answered one (`used`), and the trim removes
   whichever has aged the most since then, divided by one more for each reuse:
